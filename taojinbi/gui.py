@@ -18,7 +18,7 @@ class App:
         self.root = root
         root.title("淘金币 · ADB 浏览助手")
         root.geometry("980x800")
-        root.minsize(860, 760)
+        root.minsize(860, 800)
         style = ttk.Style(root)
         style.theme_use("clam")
         style.configure(".", font=("Microsoft YaHei UI", 10))
@@ -38,6 +38,7 @@ class App:
         self.status = tk.StringVar(value="连接手机并打开淘金币任务列表，然后点击“检查连接”。")
         self.counter = tk.StringVar(value="本次确认完成 0 项")
         self.limit = tk.StringVar(value="0")
+        self.all_browse = tk.BooleanVar(value=True)
         try:
             settings = json.loads((ROOT / ".local-settings.json").read_text(encoding="utf-8"))
             self.adb_path.set(settings.get("adb", default_adb()))
@@ -69,9 +70,11 @@ class App:
         self.scan_button.grid(row=1, column=3, sticky="w")
         connection.columnconfigure(1, weight=1)
         table_frame = ttk.Frame(outer)
+        self.auto_check = ttk.Checkbutton(outer, text="自动处理全部站内浏览任务（跟随换名；取消后按下方勾选执行）", variable=self.all_browse)
+        self.auto_check.pack(anchor="w", pady=(0, 4))
         table_frame.pack(fill="both", expand=True, pady=(6, 10))
         self.table = ttk.Treeview(table_frame, columns=("check", "title", "progress", "detail", "support"),
-                                  show="headings", selectmode="browse", height=7)
+                                  show="headings", selectmode="browse", height=6)
         for name, label, width in (("check", "执行", 50), ("title", "任务", 230),
                                     ("progress", "进度", 70), ("detail", "要求", 230), ("support", "状态", 125)):
             self.table.heading(name, text=label)
@@ -113,7 +116,7 @@ class App:
 
     def busy(self, value: bool, running: bool = False):
         for widget in (self.connect_button, self.scan_button, self.start_button,
-                       self.browse_button, self.path_entry, self.limit_box):
+                       self.browse_button, self.path_entry, self.limit_box, self.auto_check):
             widget.configure(state="disabled" if value else "normal")
         self.device_box.configure(state="disabled" if value else "readonly")
         self.pause_button.configure(state="normal" if running else "disabled", text="暂停")
@@ -134,7 +137,8 @@ class App:
             messagebox.showinfo("设备", "请先检查连接并选择设备。")
             return
         titles = [title for title, task in self.tasks.items() if title in self.selected and self.available(task)]
-        if mode == "run" and not titles:
+        all_browse = self.all_browse.get()
+        if mode == "run" and not titles and not all_browse:
             messagebox.showinfo("任务", "请先扫描任务并勾选可执行项目。")
             return
         self.control = Control()
@@ -154,10 +158,10 @@ class App:
                     self.messages.put(("directory", runner.directory))
                     if mode == "scan":
                         runner.scan()
-                        self.messages.put(("state", "扫描完成，勾选任务后开始执行。"))
+                        self.messages.put(("state", "扫描完成，可以开始执行。"))
                     else:
                         self.messages.put(("reset_count", None))
-                        runner.run(titles, limit=limit or None)
+                        runner.run(titles, limit=limit or None, all_browse=all_browse)
             except Stopped:
                 self.messages.put(("state", "已停止"))
             except Exception as exc:
@@ -176,7 +180,7 @@ class App:
         for task in tasks:
             available = self.available(task)
             checked = "☑" if available and task.title in self.selected else "☐" if available else "—"
-            state = "可执行" if available else "已完成" if not task.remaining else "待适配 / 跳过"
+            state = "站内浏览" if available else "已完成" if not task.remaining else task.skip_reason
             self.table.insert("", "end", iid=task.title,
                               values=(checked, task.title, f"{task.done}/{task.total}", task.detail, state),
                               tags=() if available else ("unavailable",))

@@ -34,11 +34,12 @@ def page(tasks=(), progress=0, overlay=False):
     return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
 
 
-def immersive(completed=False):
+def immersive(completed=False, seconds=15, reward=400):
     root = ET.Element("hierarchy")
-    window = node(root)
-    node(window, "实付需满0.5元才可得奖励哦", "[700,1200][1180,1250]")
-    node(window, "任务已完成" if completed else "浏览15秒", "[900,1100][1180,1160]")
+    window = node(root, **{"resource-id": "ice-container"})
+    node(window, "任务已完成" if completed else f"浏览{seconds}秒", "[900,1100][1180,1160]")
+    node(window, f"已得{reward}" if completed else f"得{reward}", "[900,1160][1180,1220]")
+    node(window, "实付需满0.5元才可得奖励哦", "[700,1220][1180,1270]")
     return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
 
 
@@ -61,9 +62,13 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(Rect.parse("[0,0][0,0]").valid(1200, 2670))
         self.assertFalse(Rect.parse("[200,2664][900,2622]").valid(1200, 2670))
 
-    def test_unverified_or_spending_tasks_unavailable(self):
-        for title in ("好物随心逛", "搜一搜你心仪的宝贝", "天猫积分换能量", "去签到领红包"):
+    def test_external_or_spending_tasks_unavailable(self):
+        for title in ("逛一逛支付宝金豆夺宝", "去芭芭农场领水果", "天猫积分换能量", "邀请好友", "下单奖励", "下载安装领能量"):
             self.assertFalse(page([(title, 0, 1, 900)]).task(title).supported)
+
+    def test_browse_support_follows_requirements_after_caption_changes(self):
+        for title in ("好物随心逛", "搜一搜你心仪的宝贝", "看看#屏幕挂灯", "拍立淘逛感兴趣的宝贝", "去签到领红包", "全新活动名"):
+            self.assertTrue(page([(title, 0, 1, 900)]).task(title).supported)
 
     def test_no_button_cannot_borrow_neighbor(self):
         s = page([("好物沉浸看", 0, 5, 900), ("其他任务", 0, 1, 1200)])
@@ -122,7 +127,8 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(immersive(True).browse_page("好物沉浸看"))
         self.assertTrue(immersive(True).completed_badge())
         self.assertFalse(page().browse_page("好物沉浸看"))
-        self.assertFalse(immersive().browse_page("好物随心逛"))
+        self.assertTrue(immersive().browse_page("好物随心逛"))
+        self.assertFalse(immersive().browse_page("逛一逛支付宝农场"))
 
     def test_bad_xml_is_explicit_failure(self):
         with self.assertRaises(Halt):

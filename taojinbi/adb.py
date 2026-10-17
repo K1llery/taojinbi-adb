@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import hashlib
+import base64
 import msvcrt
 from contextlib import contextmanager
 import shutil
@@ -175,6 +176,18 @@ class Adb:
 
     def input(self, snapshot: Snapshot, *args: str):
         self.run(["shell", "input", *args], epoch=snapshot.epoch)
+
+    def set_search(self, snapshot: Snapshot, query: str):
+        if not self.reader_path:
+            raise Halt("页面读取器尚未初始化")
+        classpath = f"/system/framework/android.test.runner.jar:/system/framework/uiautomator.jar:{self.reader_path}"
+        encoded = base64.b64encode(query.encode("utf-8")).decode("ascii")
+        command = "set-web-search" if snapshot.page_kind() == "web_search" else "set-search"
+        output = self.run(["shell", "ANDROID_DATA=/data/local/tmp", f"CLASSPATH={classpath}",
+                           "app_process", "/system/bin", "UiDump", command, encoded],
+                          timeout=15, epoch=snapshot.epoch)
+        if output.strip() != b"OK":
+            raise Halt("搜索文字设置结果未确认")
 
     def screenshot(self, path: Path):
         data = self.run(["exec-out", "screencap", "-p"])
