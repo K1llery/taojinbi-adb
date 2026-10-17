@@ -1,0 +1,9 @@
+[project]
+name = "taojinbi-adb"
+version = "0.1.0"
+description = "Windows 上的淘金币浏览任务辅助工具"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.uv]
+package = false

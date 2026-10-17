@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+artifacts/
+tools/platform-tools/
+tools/build/
+tools/r8-*.jar
+.local-settings.json
+!/.python-version
+!/tools/ui-dump.jar
