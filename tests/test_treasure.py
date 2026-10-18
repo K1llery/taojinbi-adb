@@ -164,14 +164,13 @@ class TreasureRunnerTests(unittest.TestCase):
         self.adb.input.assert_not_called()
 
     def test_return_rechecks_after_pause_before_sending_back(self):
-        self.adb.snapshot.side_effect = [live_page(completed=True),live_page(completed=True),task_page()]
+        self.adb.snapshot.side_effect = [live_page(completed=True),task_page()]
         self.adb.input.side_effect = RefreshRequired()
         self.assertTrue(TreasurePage(self.runner.leave_live()).is_list)
         self.assertEqual(self.adb.input.call_count,1)
 
     def test_return_rejects_a_different_room_after_pause(self):
-        self.adb.snapshot.side_effect = [live_page(completed=True),live_page(completed=True),
-                                        live_page(completed=True,room='99999')]
+        self.adb.snapshot.side_effect = [live_page(completed=True),live_page(completed=True,room='99999')]
         self.adb.input.side_effect = RefreshRequired()
         with self.assertRaisesRegex(Halt,'直播间身份已变化'):
             self.runner.leave_live()
