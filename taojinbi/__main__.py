@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--scan", action="store_true", help="只读扫描，不执行点击")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--task", action="append", help="执行指定站内浏览任务，可以重复指定")
-    selection.add_argument("--all-browse", action="store_true", help="持续发现全部站内浏览任务，跟随名称与位置变化")
+    selection.add_argument("--all-browse", action="store_true", help="持续发现站内浏览与应用跳转任务，跟随名称与位置变化")
     parser.add_argument("--limit", type=int, default=1, help="命令行默认只执行1次；0表示全部")
     parser.add_argument("--query", default="鼠标", help="搜索任务的商品词，默认鼠标，最多40个字符")
     args = parser.parse_args()

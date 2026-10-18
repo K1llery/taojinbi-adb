@@ -57,6 +57,8 @@ def missing_app(label: str) -> str:
             return name
         if INSTALLED is not None and package not in INSTALLED:
             return name
+        # Longer app names are listed first; do not also require the regular edition.
+        return ""
     return ""
 
 
@@ -185,6 +187,7 @@ class Snapshot:
     width: int
     height: int
     epoch: int = 0
+    reward_anchor: Rect | None = None
 
     def __post_init__(self):
         try:
@@ -280,18 +283,11 @@ class Snapshot:
             grouped.setdefault(task.title, []).append(task)
         result: dict[str, Task] = {}
         for title, candidates in grouped.items():
-            if len(candidates) == 1:
+            if all(t == candidates[0] for t in candidates):
                 result[title] = candidates[0]
                 continue
-            # The stale row repeats a counter that another row still owns.
-            shared = {(t.done, t.total) for t in rows if t.title != title}
-            pool = [t for t in candidates if (t.done, t.total) not in shared] or candidates
-            top = max(t.done for t in pool)
-            winners = [t for t in pool if t.done == top]
-            if len(winners) == 1:
-                result[title] = winners[0]
-            else:
-                self.ambiguous.add(title)
+            # Counts and viewport positions cannot identify which duplicate is current.
+            self.ambiguous.add(title)
         return list(result.values())
 
     def task(self, title: str) -> Task | None:
@@ -318,19 +314,28 @@ class Snapshot:
             return ""
         return re.sub(r"\s+", "", "".join(n.get("text", "") for n in panels[0].iter("node") if self.visible(n)))
 
-    def generic_panel(self) -> str:
-        """A floating component that states a browse timer and its reward, on any activity page."""
+    def generic_component(self) -> tuple[Rect, str] | None:
+        """Only a previously observed timer can anchor a generic completion component."""
+        candidates = []
         for node in self.nodes:
             if not self.visible(node):
                 continue
             rect = Rect.parse(node.get("bounds", ""))
             if rect.bottom - rect.top > self.height * .55 or rect.right - rect.left > self.width * .95:
                 continue
-            text = re.sub(r"\s+", "", "".join(n.get("text", "") for n in node.iter("node")
-                                              if self.visible(n)))
-            if re.search(r"浏览\d+秒", text) and re.search(r"已?得\d+", text):
-                return text
-        return ""
+            labels = [n.get("text", "") for n in node.iter("node") if self.visible(n) and n.get("text")]
+            if len(labels) < 2:
+                continue
+            text = re.sub(r"\s+", "", "".join(labels))
+            running = re.search(r"浏览\d+秒得\d+", text)
+            completed = rect == self.reward_anchor and "任务已完成" in text and re.search(r"已得\d+", text)
+            if running or completed:
+                candidates.append((rect, text))
+        return min(candidates, key=lambda c: (c[0].right-c[0].left)*(c[0].bottom-c[0].top)) if candidates else None
+
+    def generic_panel(self) -> str:
+        component = self.generic_component()
+        return component[1] if component else ""
 
     def panel_text(self) -> str:
         return self.reward_panel() or self.generic_panel()

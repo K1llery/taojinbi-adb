@@ -184,18 +184,9 @@ class App:
         self.worker.start()
 
     def render_tasks(self, tasks):
-        previous = list(self.tasks.values())
         if not self.has_scanned:
             self.selected = {t.title for t in tasks if self.available(t)}
             self.has_scanned = True
-        else:
-            # A renamed slot keeps the user's choice; match it by its position in the list.
-            current = {t.title for t in tasks}
-            for index, old in enumerate(previous):
-                if old.title in self.selected and old.title not in current and index < len(tasks):
-                    renamed = tasks[index]
-                    if self.available(renamed):
-                        self.selected.add(renamed.title)
         self.tasks = {t.title: t for t in tasks}
         self.table.delete(*self.table.get_children())
         for task in tasks:

@@ -165,8 +165,8 @@ class Adb:
                           activity)
         return match[1] if match else ""
 
-    def launch_taobao(self):
-        self.run(["shell", "am", "start", "-n", f"{PACKAGE}/com.taobao.tao.welcome.Welcome"])
+    def launch_taobao(self, epoch: int | None = None):
+        self.run(["shell", "am", "start", "-n", f"{PACKAGE}/com.taobao.tao.welcome.Welcome"], epoch=epoch)
 
     def snapshot(self) -> Snapshot:
         self.control.checkpoint()

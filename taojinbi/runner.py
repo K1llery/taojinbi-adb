@@ -18,6 +18,7 @@ JUMP_LAUNCH_TIMEOUT = 20
 BACK_ATTEMPTS = 3
 # A task that cannot be confirmed twice is left alone for the rest of the session.
 MAX_TASK_FAILURES = 2
+MAX_CONSECUTIVE_FAILURES = 3
 # An unknown in-app page is accepted after this many consecutive frames; its text keeps
 # moving (countdowns, prices), so identical frames can never be required.
 UNKNOWN_PAGE_FRAMES = 3
@@ -45,6 +46,11 @@ def advanced_task(before: Task, baseline: list[Task], current: list[Task],
     """A rotating caption must never turn into a stable task identifier."""
     if before_total is None or current_total != before_total + 1:
         return None
+    return advanced_row(before, baseline, current)
+
+
+def advanced_row(before: Task, baseline: list[Task], current: list[Task]) -> Task | None:
+    """Attribute exactly one count increase independently of a capped daily counter."""
     old = Counter(t.done for t in baseline if t.group == before.group)
     new = Counter(t.done for t in current if t.group == before.group)
     if old[before.done] != 1:
@@ -86,6 +92,7 @@ class Runner:
         self.skip: set[str] = set()
         self.failures: dict[str, int] = {}
         self.ambiguous: set[str] = set()
+        self.generic_anchor: Rect | None = None
 
     def log(self, message: str, **data):
         event = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -100,10 +107,13 @@ class Runner:
 
     def observe(self, external: bool = False) -> Snapshot:
         s = self.adb.snapshot()
+        s.reward_anchor = self.generic_anchor
         self.last = s
         self.steps += 1
         (self.directory / f"{self.steps:03d}.xml").write_text(s.xml, encoding="utf-8")
         s.check(external)
+        if s.is_list:
+            s.tasks()
         if s.ambiguous and s.ambiguous != self.ambiguous:
             self.ambiguous = set(s.ambiguous)
             self.log("同名任务行出现复用残留，本次不执行这些行", titles=sorted(s.ambiguous))
@@ -232,7 +242,9 @@ class Runner:
             else:
                 raise Halt("列表范围无法确认，停止自动发现")
         self.log("已检查完整列表，没有剩余可执行任务",
-                 skipped=[{"title": t.title, "reason": t.skip_reason or "已完成"} for t in s.tasks()])
+                 skipped=[{"title": t.title, "reason": t.skip_reason or
+                           ("本轮失败后跳过" if t.title in self.skip else "已完成")} for t in s.tasks()],
+                 ambiguous=sorted(s.ambiguous))
         return None
 
     def tap_task(self, title: str) -> tuple[Task, int | None]:
@@ -274,6 +286,9 @@ class Runner:
                 if not s.task_in_progress(task) and not s.task_completed(task):
                     raise TaskFailed("目标页任务组件与本次浏览要求不符")
                 self.page = kind
+                if kind == "overlay" and not s.reward_panel():
+                    component = s.generic_component()
+                    self.generic_anchor = component[0] if component else None
                 self.started_signal = s.task_in_progress(task)
                 self.finished_signal = False
                 self.log("已识别浏览页面", page=kind, task=task.title)
@@ -428,6 +443,7 @@ class Runner:
         return self.back(self.page, "list", title)
 
     def execute_one(self, title: str) -> Result:
+        self.generic_anchor = None
         self.state(f"准备进入：{title}")
         before, before_total = self.tap_task(title)
         try:
@@ -445,8 +461,8 @@ class Runner:
         s = self.return_to_list(title)
         return self.verify_browse(before, before_total, s)
 
-    def record_success(self, before: Task, s: Snapshot, reason: str) -> Result:
-        result = Result(before.title, before.done, None, True, reason)
+    def record_success(self, before: Task, s: Snapshot, reason: str, after: int | None = None) -> Result:
+        result = Result(before.title, before.done, after, True, reason)
         self.results.append(result)
         self.log("任务完成", **asdict(result), global_progress=s.progress)
         self.emit("result", result)
@@ -462,12 +478,17 @@ class Runner:
         self.emit("task_failed", result)
         return result
 
-    def counter_capped(self, s: Snapshot, before: Task, before_total: int | None) -> bool:
-        """At the daily cap the counter cannot move; a cleared row is all that is left."""
+    def capped_completion(self, s: Snapshot, before: Task, before_total: int | None,
+                          component: bool = False) -> Result | None:
+        """A missing caption is never evidence: it can be renamed, hidden or ambiguous."""
         if not s.counter_full or s.progress != before_total:
-            return False
-        row = s.task(before.title)
-        return row is None or row.done > before.done
+            return None
+        row = advanced_row(before, self.baseline_tasks, s.tasks())
+        if row is not None:
+            return self.record_success(before, s, "今日总进度已满，单项次数唯一增加1", row.done)
+        if component and self.started_signal and self.finished_signal:
+            return self.record_success(before, s, "今日总进度已满，奖励组件由浏览中转为完成；单项次数未归因")
+        return None
 
     def verify_completion(self, before: Task, before_total: int | None, s: Snapshot,
                           reason: str) -> Result:
@@ -475,8 +496,9 @@ class Runner:
         while True:
             if before_total is not None and s.progress == before_total + 1:
                 return self.record_success(before, s, reason)
-            if self.counter_capped(s, before, before_total):
-                return self.record_success(before, s, "今日总进度已满，按任务行消失确认（弱证据）")
+            capped = self.capped_completion(s, before, before_total)
+            if capped:
+                return capped
             if self.control.clock() >= deadline:
                 return self.record_failure(before, s)
             self.control.wait(2)
@@ -495,23 +517,29 @@ class Runner:
                 if advanced and advanced.title != before.title:
                     self.log("任务名称已轮换，次数变化唯一匹配",
                              previous=before.title, current=advanced.title)
-                return self.record_success(before, s, reason)
-            if self.counter_capped(s, before, before_total):
-                return self.record_success(before, s, "今日总进度已满，按任务行消失确认（弱证据）")
+                return self.record_success(before, s, reason, advanced.done if advanced else None)
+            capped = self.capped_completion(s, before, before_total, component=True)
+            if capped:
+                return capped
             if self.control.clock() >= deadline:
                 return self.record_failure(before, s)
             self.control.wait(2)
             s = self.observe()
             self.list_only(s)
 
-    def external_input(self, *args: str, title: str = ""):
-        """Send one gesture while another app is in front; no page model is assumed."""
+    def back_inside_taobao(self, title: str) -> Snapshot:
+        """Recheck the foreground and list on the exact snapshot used for the back press."""
         while True:
             s = self.observe(external=True)
+            if s.package != PACKAGE:
+                return s
+            s.check()
+            if s.is_list:
+                return s
             try:
-                self.adb.input(s, *args)
-                self.log("发送操作", action=args[0], task=title)
-                return
+                self.adb.input(s, "keyevent", "4")
+                self.log("发送操作", action="keyevent", task=title)
+                return s
             except RefreshRequired:
                 self.control.checkpoint()
 
@@ -536,10 +564,20 @@ class Runner:
     def resume_taobao(self):
         """Never relaunch while Taobao is already in front: Welcome would start a new
         activity and drop the task list back to the shop home page."""
-        if self.adb.foreground() == PACKAGE:
-            return
-        self.state("拉起淘宝")
-        self.adb.launch_taobao()
+        while True:
+            self.control.checkpoint()
+            epoch = self.control.epoch
+            package = self.adb.foreground()
+            if package == PACKAGE:
+                return
+            if not package:
+                raise Halt("无法确认前台应用，已停止拉起淘宝")
+            try:
+                self.adb.launch_taobao(epoch=epoch)
+                self.state("拉起淘宝")
+                return
+            except RefreshRequired:
+                continue
 
     def settle_list(self, timeout: float) -> Snapshot | None:
         deadline = self.control.clock() + timeout
@@ -575,9 +613,12 @@ class Runner:
                 continue
             if presses >= BACK_ATTEMPTS:
                 raise Halt("已回到淘宝，但没有识别到任务列表，请手动返回列表后重新开始")
-            presses += 1
-            self.log("在淘宝内部返回一次", attempt=presses, task=title)
-            self.external_input("keyevent", "4", title=title)
+            fresh = self.back_inside_taobao(title)
+            if fresh.package == PACKAGE and fresh.is_list:
+                return fresh
+            if fresh.package == PACKAGE:
+                presses += 1
+                self.log("在淘宝内部返回一次", attempt=presses, task=title)
             self.control.wait(2)
         raise Halt("从外部应用返回后没有回到任务列表")
 
@@ -625,6 +666,7 @@ class Runner:
             self.log("会话开始", selected=titles, limit=limit, all_browse=all_browse)
             self.scan()
             changes = 0
+            consecutive_failures = 0
             while True:
                 pending = False
                 self.ensure_front()
@@ -671,11 +713,15 @@ class Runner:
                         self.recover_list(title)
                     changes = 0
                     if result is None or not result.success:
+                        consecutive_failures += 1
                         self.failures[title] = self.failures.get(title, 0) + 1
                         if self.failures[title] >= MAX_TASK_FAILURES:
                             self.skip.add(title)
                             self.state(f"“{title}”连续{MAX_TASK_FAILURES}次未确认完成，本轮跳过并继续")
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            raise Halt("连续3次任务未确认完成，已停止，避免任务换名后反复执行")
                         continue
+                    consecutive_failures = 0
                     if limit is not None and len(self.results) >= limit:
                         self.state(f"达到本次上限：{len(self.results)} 项已完成")
                         return

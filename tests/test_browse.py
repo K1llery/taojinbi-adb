@@ -434,8 +434,8 @@ class JumpTaskTests(unittest.TestCase):
             runner.jump_back = Mock(return_value=page([("逛一逛支付宝农场", 1, 1, 900)], 47))
             self.assertTrue(runner.execute_one("逛一逛支付宝农场").success)
 
-    def test_daily_cap_uses_the_cleared_row_as_weak_evidence(self):
-        # 50/50 cannot move, so a consumed row is the only remaining evidence.
+    def test_daily_cap_does_not_accept_a_renamed_or_missing_row(self):
+        # A missing caption can be caused by rotation; it is not completion evidence.
         adb = Mock(control=Control())
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
@@ -447,8 +447,7 @@ class JumpTaskTests(unittest.TestCase):
             runner.observe = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 50))
             runner.jump_back = Mock(return_value=page([("其他新任务", 0, 1, 900)], 50))
             result = runner.execute_one("逛一逛支付宝农场")
-        self.assertTrue(result.success)
-        self.assertIn("弱证据", result.reason)
+        self.assertFalse(result.success)
 
     def test_daily_cap_never_accepts_an_untouched_row(self):
         adb = Mock(control=Control())

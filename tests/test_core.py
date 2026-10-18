@@ -106,12 +106,12 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(s.tasks(), [])
         self.assertEqual(s.ambiguous, {"好物沉浸看"})
 
-    def test_stale_caption_loses_to_the_counter_another_row_owns(self):
+    def test_duplicate_caption_cannot_be_identified_from_another_rows_counter(self):
         s = page([("搜一搜你心仪的宝贝", 3, 10, 900), ("看看#隔离霜", 3, 10, 1200),
                   ("搜一搜你心仪的宝贝", 4, 5, 1500)])
-        task = s.task("搜一搜你心仪的宝贝")
-        self.assertEqual((task.done, task.total), (4, 5))
-        self.assertEqual(s.ambiguous, set())
+        self.assertIsNone(s.task("搜一搜你心仪的宝贝"))
+        self.assertEqual(s.ambiguous, {"搜一搜你心仪的宝贝"})
+        self.assertIsNotNone(s.task("看看#隔离霜"))
 
     def test_risk_text_and_description_halt(self):
         for attr in ("text", "content-desc"):
