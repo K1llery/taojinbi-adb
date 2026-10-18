@@ -70,7 +70,7 @@ class App:
         self.scan_button.grid(row=1, column=3, sticky="w")
         connection.columnconfigure(1, weight=1)
         table_frame = ttk.Frame(outer)
-        self.auto_check = ttk.Checkbutton(outer, text="自动处理全部站内浏览任务（跟随换名；取消后按下方勾选执行）", variable=self.all_browse)
+        self.auto_check = ttk.Checkbutton(outer, text="自动处理全部可执行任务（站内浏览 + 跳转其他 APP；跟随换名）", variable=self.all_browse)
         self.auto_check.pack(anchor="w", pady=(0, 4))
         table_frame.pack(fill="both", expand=True, pady=(6, 10))
         self.table = ttk.Treeview(table_frame, columns=("check", "title", "progress", "detail", "support"),
@@ -180,7 +180,10 @@ class App:
         for task in tasks:
             available = self.available(task)
             checked = "☑" if available and task.title in self.selected else "☐" if available else "—"
-            state = "站内浏览" if available else "已完成" if not task.remaining else task.skip_reason
+            if available:
+                state = "跳转任务" if task.jump else "站内浏览"
+            else:
+                state = "已完成" if not task.remaining else task.skip_reason
             self.table.insert("", "end", iid=task.title,
                               values=(checked, task.title, f"{task.done}/{task.total}", task.detail, state),
                               tags=() if available else ("unavailable",))
@@ -241,6 +244,8 @@ class App:
                 elif kind == "result":
                     self.completed += 1
                     self.counter.set(f"本次确认完成 {self.completed} 项")
+                elif kind == "jump_failed":
+                    self.add_log(f"跳转未完成：{value.title}（{value.reason}）")
                 elif kind == "error":
                     self.status.set(f"已停止：{value}")
                     self.add_log(value)

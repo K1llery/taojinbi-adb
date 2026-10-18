@@ -6,8 +6,11 @@ from dataclasses import dataclass
 
 PACKAGE = "com.taobao.taobao"
 TASK_RE = re.compile(r"^(.+?)\((\d+)/(\d+)\)(.*)$")
-EXTERNAL_RE = re.compile(r"支付宝|蚂蚁|芭芭|农场|领水果|京东|抖音|快手|拼多多|微信|闲鱼|饿了么|飞猪|高德|菜鸟|夸克|1688|钉钉|千问|淘特|阿里云盘|跳转|打开\s*(?:APP|应用)|下载|安装", re.I)
-OTHER_RE = re.compile(r"邀请|好友|助力|兑换|积分|答题|考试|游戏|下单|购买|支付|开通|订阅|关注|收藏|加购|授权|拍照|上传")
+# A jump task opens another app and grants its reward on entry; it carries no browse timer.
+JUMP_RE = re.compile(r"^点击去逛|^逛一逛|跳转|打开\s*(?:APP|应用)", re.I)
+EXTERNAL_APP_RE = re.compile(r"支付宝|蚂蚁|芭芭|农场|领水果|京东|抖音|快手|拼多多|微信|闲鱼|饿了么|飞猪|高德|菜鸟|夸克|1688|钉钉|千问|淘特|阿里云盘|微博|百度", re.I)
+DOWNLOAD_RE = re.compile(r"下载|安装")
+OTHER_RE = re.compile(r"邀请|好友|助力|兑换|积分|答题|考试|游戏|下单|购买|支付(?!宝)|开通|订阅|关注|收藏|加购|授权|拍照|上传")
 RISK_RE = re.compile(r"滑动.{0,8}验证|拖动.{0,8}滑块|请完成.{0,8}验证|请进行.{0,8}验证|安全验证|访问过于频繁|操作.{0,4}频繁|账号存在风险|账户存在风险|行为异常|身份验证|验证码|人机验证|网络开小差|网络异常|请检查网络")
 
 
@@ -59,19 +62,35 @@ class Task:
     button: Rect | None
 
     @property
+    def kind(self) -> str:
+        """``browse``, ``jump``, or ``""`` when the task must be skipped."""
+        label = self.title + self.detail
+        if DOWNLOAD_RE.search(label) or OTHER_RE.search(label):
+            return ""
+        if JUMP_RE.search(self.title) or JUMP_RE.search(self.detail) or EXTERNAL_APP_RE.search(label):
+            return "jump"
+        if self.seconds is not None and 0 < self.seconds <= 120:
+            return "browse"
+        return ""
+
+    @property
+    def jump(self) -> bool:
+        return self.kind == "jump"
+
+    @property
     def supported(self) -> bool:
-        return not self.skip_reason
+        return bool(self.kind)
 
     @property
     def skip_reason(self) -> str:
+        if self.kind:
+            return ""
         label = self.title + self.detail
-        if EXTERNAL_RE.search(label):
-            return "跨应用任务跳过"
+        if DOWNLOAD_RE.search(label):
+            return "需要下载安装，跳过"
         if OTHER_RE.search(label):
             return "非纯浏览任务跳过"
-        if self.seconds is None or not 0 < self.seconds <= 120:
-            return "非计时浏览任务跳过"
-        return ""
+        return "非计时浏览任务跳过"
 
     @property
     def reward(self) -> str:
@@ -122,17 +141,18 @@ class Snapshot:
         values = [int(m.group(1)) for t in self.texts if (m := re.fullmatch(r"(\d+)/\d+", t))]
         return values[0] if len(values) == 1 else None
 
-    def check(self):
-        if self.package != PACKAGE:
-            raise Halt(f"前台应用已变化：{self.package or '无法确认'}。请回到淘宝后重新开始。")
-        for node in self.nodes:
-            if not self.visible(node):
-                continue
-            if node.get("package", "") not in ("", PACKAGE):
-                # Exclude status/navigation bars but stop on external dialogs/windows.
-                rect = Rect.parse(node.get("bounds", ""))
-                if rect.bottom > self.height * .10 and rect.top < self.height * .90:
-                    raise Halt("检测到其他应用或系统弹窗，请人工处理。")
+    def check(self, external: bool = False):
+        if not external:
+            if self.package != PACKAGE:
+                raise Halt(f"前台应用已变化：{self.package or '无法确认'}。请回到淘宝后重新开始。")
+            for node in self.nodes:
+                if not self.visible(node):
+                    continue
+                if node.get("package", "") not in ("", PACKAGE):
+                    # Exclude status/navigation bars but stop on external dialogs/windows.
+                    rect = Rect.parse(node.get("bounds", ""))
+                    if rect.bottom > self.height * .10 and rect.top < self.height * .90:
+                        raise Halt("检测到其他应用或系统弹窗，请人工处理。")
         for text in self.texts:
             if RISK_RE.search(text):
                 raise Halt(f"页面出现需要人工处理的提示：{text[:100]}")
@@ -178,7 +198,8 @@ class Snapshot:
                      if TASK_RE.fullmatch(n.get("text", "").strip()) and self.visible(n))
 
     def browse_page(self, title: str) -> bool:
-        return supported_title(title) and self.page_kind() in ("overlay", "feed", "guide")
+        return (supported_title(title) and not jump_title(title) and
+                self.page_kind() in ("overlay", "feed", "guide"))
 
     def header_text(self) -> str:
         header = next((n for n in self.nodes if n.get("resource-id") == "composeHeaderNav"), None)
@@ -307,7 +328,12 @@ class Snapshot:
 
 
 def supported_title(title: str) -> bool:
-    return not EXTERNAL_RE.search(title) and not OTHER_RE.search(title)
+    """Jump titles are executable too; only download and non-browse tasks are refused."""
+    return not DOWNLOAD_RE.search(title) and not OTHER_RE.search(title)
+
+
+def jump_title(title: str) -> bool:
+    return bool(JUMP_RE.search(title) or EXTERNAL_APP_RE.search(title))
 
 
 def reward_matches(task: Task, text: str, pattern: str) -> bool:

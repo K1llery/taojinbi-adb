@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from .model import Halt, RefreshRequired, Snapshot, Stopped
+from .model import Halt, PACKAGE, RefreshRequired, Snapshot, Stopped
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -154,6 +154,16 @@ class Adb:
             self.size = tuple(map(int, sizes[-1]))
         return self.size
 
+    def foreground(self) -> str:
+        activity = self.run(["shell", "dumpsys", "activity", "activities"]).decode("utf-8", "replace")
+        match = re.search(r"(?:topResumedActivity|mResumedActivity)\s*[=:].*?\s([\w.]+)/", activity)
+        if not match:
+            raise Halt("无法确认前台应用")
+        return match[1]
+
+    def launch_taobao(self):
+        self.run(["shell", "am", "start", "-n", f"{PACKAGE}/com.taobao.tao.welcome.Welcome"])
+
     def snapshot(self) -> Snapshot:
         self.control.checkpoint()
         epoch = self.control.epoch
@@ -168,11 +178,7 @@ class Adb:
         classpath = f"/system/framework/android.test.runner.jar:/system/framework/uiautomator.jar:{self.reader_path}"
         xml = self.run(["shell", "ANDROID_DATA=/data/local/tmp", f"CLASSPATH={classpath}",
                         "app_process", "/system/bin", "UiDump"], timeout=15).decode("utf-8", "replace")
-        activity = self.run(["shell", "dumpsys", "activity", "activities"]).decode("utf-8", "replace")
-        foreground = re.search(r"(?:topResumedActivity|mResumedActivity)\s*[=:].*?\s([\w.]+)/", activity)
-        if not foreground:
-            raise Halt("无法确认前台应用")
-        return Snapshot(xml, foreground[1], *self.dimensions(), epoch=epoch)
+        return Snapshot(xml, self.foreground(), *self.dimensions(), epoch=epoch)
 
     def input(self, snapshot: Snapshot, *args: str):
         self.run(["shell", "input", *args], epoch=snapshot.epoch)

@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Callable
 
 from .adb import Adb, ROOT
-from .model import Halt, Rect, RefreshRequired, Snapshot, Stopped, Task, TaskChanged, supported_title
+from .model import (PACKAGE, Halt, Rect, RefreshRequired, Snapshot, Stopped, Task,
+                    TaskChanged, supported_title)
+
+# A jump task grants its reward on entry, so it only needs the external app to appear.
+JUMP_DWELL = 2.0
+JUMP_LAUNCH_TIMEOUT = 20
+BACK_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,7 @@ class Runner:
             raise Halt("搜索词须为1至40个可见字符")
         self.search_query = search_query
         self.searched = False
+        self.skip: set[str] = set()
 
     def log(self, message: str, **data):
         event = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -84,12 +91,12 @@ class Runner:
         self.emit("state", message)
         self.log(message)
 
-    def observe(self) -> Snapshot:
+    def observe(self, external: bool = False) -> Snapshot:
         s = self.adb.snapshot()
         self.last = s
         self.steps += 1
         (self.directory / f"{self.steps:03d}.xml").write_text(s.xml, encoding="utf-8")
-        s.check()
+        s.check(external)
         return s
 
     def list_only(self, s: Snapshot):
@@ -186,7 +193,7 @@ class Runner:
         s = self.observe()
         self.list_only(s)
         self.emit("tasks", s.tasks())
-        candidate = self.candidate(s.tasks())
+        candidate = self.candidate([t for t in s.tasks() if t.title not in self.skip])
         if candidate:
             return candidate
         # Verify exhaustion across the whole scrollable list, not only the viewport.
@@ -196,7 +203,7 @@ class Runner:
                 self.list_scroll(down)
                 s = self.observe()
                 self.list_only(s)
-                candidate = self.candidate(s.tasks())
+                candidate = self.candidate([t for t in s.tasks() if t.title not in self.skip])
                 if candidate:
                     return candidate
                 fingerprint = s.fingerprint()
@@ -207,7 +214,7 @@ class Runner:
                 previous = fingerprint
             else:
                 raise Halt("列表范围无法确认，停止自动发现")
-        self.log("已检查完整列表，没有剩余站内浏览任务",
+        self.log("已检查完整列表，没有剩余可执行任务",
                  skipped=[{"title": t.title, "reason": t.skip_reason or "已完成"} for t in s.tasks()])
         return None
 
@@ -395,6 +402,83 @@ class Runner:
             else:
                 raise Halt(f"“{title}”的进度没有确认增加，已停止；不会自动重做")
 
+    def external_input(self, *args: str, title: str = ""):
+        """Send one gesture while another app is in front; no page model is assumed."""
+        while True:
+            s = self.observe(external=True)
+            try:
+                self.adb.input(s, *args)
+                self.log("发送操作", action=args[0], task=title)
+                return
+            except RefreshRequired:
+                self.control.checkpoint()
+
+    def jump_enter(self, title: str) -> str:
+        """Wait for the external app to take the foreground; its reward is granted on entry."""
+        deadline = self.control.clock() + JUMP_LAUNCH_TIMEOUT
+        while self.control.clock() < deadline:
+            package = self.adb.foreground()
+            if package != PACKAGE:
+                self.log("已跳转到外部应用", task=title, package=package)
+                self.adb.screenshot(self.directory / "jumped.png")
+                return package
+            self.control.wait(1)
+        raise Halt("点击去完成后没有确认外部应用到前台")
+
+    def jump_back(self, title: str) -> Snapshot:
+        """Resume Taobao's own task; the external app's depth never has to be counted."""
+        self.state("从外部应用返回淘宝")
+        self.adb.launch_taobao()
+        deadline = self.control.clock() + 10
+        while self.control.clock() < deadline:
+            s = self.observe(external=True)
+            if s.package == PACKAGE and s.is_list:
+                return s
+            self.control.wait(2)
+        if self.adb.foreground() == PACKAGE:
+            raise Halt("已回到淘宝，但没有识别到任务列表，请手动返回列表后重新开始")
+        # Fallback only when the direct resume did not switch apps at all.
+        for _ in range(BACK_ATTEMPTS):
+            if self.adb.foreground() == PACKAGE:
+                break
+            self.external_input("keyevent", "4", title=title)
+            self.control.wait(2)
+        deadline = self.control.clock() + 10
+        while self.control.clock() < deadline:
+            s = self.observe(external=True)
+            if s.package == PACKAGE and s.is_list:
+                return s
+            self.control.wait(2)
+        raise Halt("从外部应用返回后没有回到任务列表")
+
+    def execute_jump(self, title: str) -> Result:
+        """Jump tasks leave no readable evidence outside Taobao; only the global counter counts."""
+        self.state(f"跳转执行：{title}")
+        before, before_total = self.tap_task(title)
+        package = self.jump_enter(title)
+        self.control.wait(JUMP_DWELL)
+        s = self.jump_back(title)
+        deadline = self.control.clock() + 15
+        while True:
+            if before_total is not None and s.progress == before_total + 1:
+                result = Result(title, before.done, None, True,
+                                f"跳转 {package} 后总进度增加1；单项次数未归因")
+                self.results.append(result)
+                self.log("任务完成", **asdict(result), global_progress=s.progress, package=package)
+                self.emit("result", result)
+                self.emit("tasks", s.tasks())
+                self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
+                return result
+            if self.control.clock() >= deadline:
+                break
+            self.control.wait(2)
+            s = self.observe()
+            self.list_only(s)
+        result = Result(title, before.done, None, False, "跳转后总进度没有增加1")
+        self.log("跳转任务未确认完成", **asdict(result), global_progress=s.progress, package=package)
+        self.emit("jump_failed", result)
+        return result
+
     def run(self, titles: list[str], limit: int | None = None, all_browse: bool = False):
         with self.adb.lease():
             return self._run(titles, limit, all_browse)
@@ -413,19 +497,35 @@ class Runner:
                 if all_browse:
                     candidate = self.discover()
                     if candidate is None:
-                        self.state("全部站内浏览任务已耗尽，会话结束；跨应用和其他任务已跳过")
+                        self.state("全部可执行任务已耗尽，会话结束")
                         return
                     current_titles = [candidate.title]
                 else:
-                    current_titles = titles
+                    current_titles = [title for title in titles if title not in self.skip]
+                    if not current_titles:
+                        self.state("选定任务已耗尽，会话结束")
+                        return
                 for title in current_titles:
                     s, task, full = self.find(title)
                     if not task or not task.remaining:
                         self.log("当前选定任务已耗尽或不在完整列表中", task=title)
                         continue
                     if not task.supported:
-                        raise Halt(f"该任务不属于站内纯浏览：{title}（{task.skip_reason}）")
+                        raise Halt(f"该任务无法自动执行：{title}（{task.skip_reason}）")
                     pending = True
+                    if task.jump:
+                        if not self.execute_jump(title).success:
+                            # One jump task is one shot; retrying it would only burn time.
+                            self.skip.add(title)
+                            self.state(f"“{title}”未确认完成，本轮跳过并继续")
+                            continue
+                        changes = 0
+                        if limit is not None and len(self.results) >= limit:
+                            self.state(f"达到本次上限：{len(self.results)} 项已完成")
+                            return
+                        self.state("任务间阅读间隔")
+                        self.control.wait(random.uniform(5, 10))
+                        continue
                     try:
                         self.execute_one(title)
                     except TaskChanged:

@@ -62,8 +62,10 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(Rect.parse("[0,0][0,0]").valid(1200, 2670))
         self.assertFalse(Rect.parse("[200,2664][900,2622]").valid(1200, 2670))
 
-    def test_external_or_spending_tasks_unavailable(self):
-        for title in ("逛一逛支付宝金豆夺宝", "去芭芭农场领水果", "天猫积分换能量", "邀请好友", "下单奖励", "下载安装领能量"):
+    def test_jump_tasks_are_executable_while_spending_and_download_are_not(self):
+        for title in ("逛一逛支付宝金豆夺宝", "去芭芭农场领水果"):
+            self.assertTrue(page([(title, 0, 1, 900)]).task(title).jump)
+        for title in ("天猫积分换能量", "邀请好友", "下单奖励", "下载安装领能量"):
             self.assertFalse(page([(title, 0, 1, 900)]).task(title).supported)
 
     def test_browse_support_follows_requirements_after_caption_changes(self):
