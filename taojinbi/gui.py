@@ -12,12 +12,15 @@ from tkinter import filedialog, messagebox, ttk
 from .adb import Adb, Control, ROOT, default_adb
 from .model import Stopped
 from .runner import Runner
+from .treasure import TreasureRunner
+
+ACTIVITIES = {"淘金币赛车": "coins", "寻宝中国 · 直播": "treasure"}
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, activity: str | None = None):
         self.root = root
-        root.title("淘金币 · ADB 浏览助手")
+        root.title("双11 · ADB 任务助手")
         root.geometry("980x800")
         root.minsize(860, 800)
         style = ttk.Style(root)
@@ -40,6 +43,7 @@ class App:
         self.counter = tk.StringVar(value="本次确认完成 0 项")
         self.limit = tk.StringVar(value="0")
         self.all_browse = tk.BooleanVar(value=True)
+        self.activity = tk.StringVar(value="淘金币赛车")
         self.notify_sound = tk.BooleanVar(value=True)
         self.notify_toast = tk.BooleanVar(value=True)
         self.toast_window: tk.Toplevel | None = None
@@ -49,8 +53,13 @@ class App:
             self.serial.set(settings.get("serial", ""))
             self.notify_sound.set(bool(settings.get("beep", True)))
             self.notify_toast.set(bool(settings.get("toast", True)))
+            saved_activity = settings.get("activity", "coins")
+            if activity is None and saved_activity in ACTIVITIES.values():
+                activity = saved_activity
         except (OSError, ValueError):
             pass
+        self.activity.set(next((name for name, key in ACTIVITIES.items() if key == activity), "淘金币赛车"))
+        self.status.set(f"连接手机并打开{self.activity.get()}任务页，然后点击“检查连接”。")
         self.build()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.drain)
@@ -58,7 +67,12 @@ class App:
     def build(self):
         outer = ttk.Frame(self.root, padding=20)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="淘金币浏览助手", style="Title.TLabel").pack(anchor="w")
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        ttk.Label(header, text="双11任务助手", style="Title.TLabel").pack(side="left")
+        self.activity_box = ttk.Combobox(header, textvariable=self.activity, values=list(ACTIVITIES), state="readonly", width=23)
+        self.activity_box.pack(side="right")
+        self.activity_box.bind("<<ComboboxSelected>>", self.change_activity)
         ttk.Label(outer, text="本地执行  ·  任务进度核验  ·  验证与异常停机").pack(anchor="w", pady=(5, 14))
         connection = ttk.Frame(outer)
         connection.pack(fill="x")
@@ -76,7 +90,7 @@ class App:
         self.scan_button.grid(row=1, column=3, sticky="w")
         connection.columnconfigure(1, weight=1)
         table_frame = ttk.Frame(outer)
-        self.auto_check = ttk.Checkbutton(outer, text="自动处理全部可执行任务（站内浏览 + 跳转其他 APP；跟随换名）", variable=self.all_browse)
+        self.auto_check = ttk.Checkbutton(outer, text="自动处理当前活动的全部可执行任务（取消后按列表勾选执行）", variable=self.all_browse)
         self.auto_check.pack(anchor="w", pady=(0, 4))
         table_frame.pack(fill="both", expand=True, pady=(6, 10))
         self.table = ttk.Treeview(table_frame, columns=("check", "title", "progress", "detail", "support"),
@@ -121,6 +135,13 @@ class App:
     def available(task):
         return task.supported and task.remaining > 0
 
+    def change_activity(self, event=None):
+        self.tasks.clear()
+        self.selected.clear()
+        self.has_scanned = False
+        self.table.delete(*self.table.get_children())
+        self.status.set(f"请打开{self.activity.get()}的任务列表，然后扫描任务。")
+
     def browse(self):
         path = filedialog.askopenfilename(title="选择 adb.exe", filetypes=[("ADB", "adb.exe")])
         if path:
@@ -131,6 +152,7 @@ class App:
                        self.browse_button, self.path_entry, self.limit_box, self.auto_check):
             widget.configure(state="disabled" if value else "normal")
         self.device_box.configure(state="disabled" if value else "readonly")
+        self.activity_box.configure(state="disabled" if value else "readonly")
         self.pause_button.configure(state="normal" if running else "disabled", text="暂停")
         self.stop_button.configure(state="normal" if value else "disabled")
 
@@ -150,6 +172,7 @@ class App:
             return
         titles = [title for title, task in self.tasks.items() if title in self.selected and self.available(task)]
         all_browse = self.all_browse.get()
+        runner_type = TreasureRunner if ACTIVITIES[self.activity.get()] == "treasure" else Runner
         if mode == "run" and not titles and not all_browse:
             messagebox.showinfo("任务", "请先扫描任务并勾选可执行项目。")
             return
@@ -166,7 +189,7 @@ class App:
                         raise RuntimeError("没有已授权设备，请检查 USB 连接及手机上的调试授权。")
                     self.messages.put(("devices", devices))
                 else:
-                    runner = Runner(adb, lambda kind, value: self.messages.put((kind, value)))
+                    runner = runner_type(adb, lambda kind, value: self.messages.put((kind, value)))
                     self.messages.put(("directory", runner.directory))
                     if mode == "scan":
                         runner.scan()
@@ -193,7 +216,7 @@ class App:
             available = self.available(task)
             checked = "☑" if available and task.title in self.selected else "☐" if available else "—"
             if available:
-                state = "跳转或站外" if task.kind == "open" else "站内浏览"
+                state = "直播浏览" if task.kind == "live" else "跳转或站外" if task.kind == "open" else "站内浏览"
             else:
                 state = "已完成" if not task.remaining else task.skip_reason
             self.table.insert("", "end", iid=task.title,
@@ -311,7 +334,8 @@ class App:
         self.close_toast()
         (ROOT / ".local-settings.json").write_text(json.dumps(
             {"adb": self.adb_path.get(), "serial": self.serial.get(),
-             "beep": self.notify_sound.get(), "toast": self.notify_toast.get()},
+             "beep": self.notify_sound.get(), "toast": self.notify_toast.get(),
+             "activity": ACTIVITIES[self.activity.get()]},
             ensure_ascii=False), encoding="utf-8")
         # Give the worker's polling loop time to reap the active adb process.
         if self.worker and self.worker.is_alive():
@@ -321,7 +345,7 @@ class App:
         self.root.destroy()
 
 
-def main():
+def main(activity: str | None = None):
     root = tk.Tk()
-    App(root)
+    App(root, activity=activity)
     root.mainloop()
