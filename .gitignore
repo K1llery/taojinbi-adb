@@ -8,3 +8,4 @@ tools/r8-*.jar
 .local-settings.json
 !/.python-version
 !/tools/ui-dump.jar
+.workbuddy-ai/

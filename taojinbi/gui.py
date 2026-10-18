@@ -202,7 +202,7 @@ class App:
             available = self.available(task)
             checked = "☑" if available and task.title in self.selected else "☐" if available else "—"
             if available:
-                state = "跳转任务" if task.jump else "站内浏览"
+                state = "跳转或站外" if task.kind == "open" else "站内浏览"
             else:
                 state = "已完成" if not task.remaining else task.skip_reason
             self.table.insert("", "end", iid=task.title,
@@ -300,8 +300,8 @@ class App:
                     self.completed += 1
                     self.counter.set(f"本次确认完成 {self.completed} 项")
                     self.notify(value.title)
-                elif kind == "jump_failed":
-                    self.add_log(f"跳转未完成：{value.title}（{value.reason}）")
+                elif kind == "task_failed":
+                    self.add_log(f"任务未确认完成：{value.title}（{value.reason}）")
                 elif kind == "error":
                     self.status.set(f"已停止：{value}")
                     self.add_log(value)

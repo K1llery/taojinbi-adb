@@ -27,9 +27,10 @@ def page(tasks=(), progress=0, overlay=False):
         extra = node(window)
         node(extra, "任务已经", "[1000,2100][1180,2150]")
         node(extra, "全部完成啦", "[1000,2150][1180,2200]")
-    for title, done, total, y in tasks:
+    for title, done, total, y, *rest in tasks:
+        detail = rest[0] if rest else "浏览15秒+400"
         row = node(window)
-        node(row, f"{title}({done}/{total})浏览15秒+400", f"[220,{y}][940,{y+100}]")
+        node(row, f"{title}({done}/{total}){detail}", f"[220,{y}][940,{y+100}]")
         node(row, "去完成", f"[942,{y}][1143,{y+93}]", clickable="true")
     return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
 
@@ -63,10 +64,16 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(Rect.parse("[200,2664][900,2622]").valid(1200, 2670))
 
     def test_jump_tasks_are_executable_while_spending_and_download_are_not(self):
-        for title in ("逛一逛支付宝金豆夺宝", "去芭芭农场领水果"):
-            self.assertTrue(page([(title, 0, 1, 900)]).task(title).jump)
-        for title in ("天猫积分换能量", "邀请好友", "下单奖励", "下载安装领能量"):
-            self.assertFalse(page([(title, 0, 1, 900)]).task(title).supported)
+        for title, detail in (("逛一逛支付宝金豆夺宝", "点击去逛+600"),
+                              ("去芭芭农场领水果", "点击去逛+600"),
+                              ("领闪购红包下单直接省", "点击去逛+600")):
+            self.assertEqual(page([(title, 0, 1, 900, detail)]).task(title).kind, "open")
+        for title, detail in (("天猫积分换能量", "每300天猫积分兑换+1500"),
+                              ("邀请好友", "邀请好友成功助力最高得+2000"),
+                              ("下单奖励", "下单购买得+600"),
+                              ("去玩趣味小游戏", "玩1款游戏得+600"),
+                              ("下载安装领能量", "点击去逛+600")):
+            self.assertFalse(page([(title, 0, 1, 900, detail)]).task(title).supported)
 
     def test_browse_support_follows_requirements_after_caption_changes(self):
         for title in ("好物随心逛", "搜一搜你心仪的宝贝", "看看#屏幕挂灯", "拍立淘逛感兴趣的宝贝", "去签到领红包", "全新活动名"):

@@ -6,8 +6,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock
 
+from taojinbi import model
 from taojinbi.adb import Control
-from taojinbi.model import PACKAGE, Halt, Rect, Snapshot, Task, TaskChanged
+from taojinbi.model import PACKAGE, Halt, Rect, Snapshot, Task, TaskChanged, TaskFailed
 from taojinbi.runner import Result, Runner, completed_transition
 from tests.test_core import immersive, node, page
 
@@ -62,6 +63,26 @@ def web_search(focused=False, value=""):
     node(panel, value, "[30,273][1170,411]", focused=str(focused).lower(),
          **{"class": "android.widget.EditText"})
     node(panel, "搜索", "[942,282][1161,399]", clickable="true", **{"class": "android.widget.Button"})
+    return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
+
+
+def shop_page(timer="42"):
+    """A 闪购 activity page: no reward component, and a countdown that keeps changing."""
+    root = ET.Element("hierarchy")
+    window = node(root)
+    for text in ("北京邮电大学", "输入商家、商品名称", f"10 : 21 : {timer}", "更多红包", "奈雪的茶"):
+        node(window, text)
+    return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
+
+
+def app_store(name="快手", company="北京快手科技有限公司"):
+    """Taobao's own app-detail page, as opened by 去快手打卡领手机."""
+    root = ET.Element("hierarchy")
+    window = node(root)
+    for text in (name, "刷新", "分享", company, "版本：14.9.10107.8M2026.10.16",
+                 "备案号：京ICP备15023266号-141A", "产品功能", "隐私政策", "权限说明",
+                 "下载32位兼容版"):
+        node(window, text)
     return Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
 
 
@@ -211,7 +232,7 @@ class BrowsePageTests(unittest.TestCase):
         self.assertIsNone(Snapshot(ET.tostring(s.root, encoding="unicode"), PACKAGE, 1200, 2670).product_card())
 
     def test_no_duration_means_jump_not_browse(self):
-        self.assertEqual(Task("新的活动名称", 0, 1, None, "点击去逛+400", None).kind, "jump")
+        self.assertEqual(Task("新的活动名称", 0, 1, None, "点击去逛+400", None).kind, "open")
         self.assertFalse(Task("新的活动名称", 0, 1, None, "去答题最高得+1000", None).supported)
 
     def test_reward_amount_is_exact_at_start_and_completion(self):
@@ -263,6 +284,7 @@ class CompletionEvidenceTests(unittest.TestCase):
             runner = Runner(adb, directory=Path(folder))
             runner.baseline_tasks = before.tasks()
             runner.tap_task = Mock(return_value=(before.task("好物沉浸看"), 4))
+            runner.await_target = Mock(return_value="")
             runner.enter = Mock(side_effect=lambda task: setattr(runner, "started_signal", True))
             runner.browse = Mock(side_effect=lambda task: setattr(runner, "finished_signal", True))
             runner.return_to_list = Mock(return_value=after)
@@ -316,6 +338,7 @@ class DiscoveryTests(unittest.TestCase):
         adb = Mock(control=Control())
         adb.lease.side_effect = lambda: nullcontext()
         adb.control.wait = Mock()
+        adb.foreground.return_value = PACKAGE
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
             runner.scan = Mock()
@@ -324,7 +347,9 @@ class DiscoveryTests(unittest.TestCase):
             visited = []
             def execute(title):
                 visited.append(title)
-                runner.results.append(Result(title, 0, 1, True, "test"))
+                result = Result(title, 0, 1, True, "test")
+                runner.results.append(result)
+                return result
             runner.execute_one = Mock(side_effect=execute)
             runner.run([], all_browse=True)
             self.assertEqual(visited, [first.title, second.title])
@@ -334,6 +359,7 @@ class DiscoveryTests(unittest.TestCase):
         task = Task("好物随心逛", 0, 5, 15, "浏览15秒+400", None)
         adb = Mock(control=Control())
         adb.lease.side_effect = lambda: nullcontext()
+        adb.foreground.return_value = PACKAGE
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
             runner.scan = Mock()
@@ -351,9 +377,9 @@ class JumpTaskTests(unittest.TestCase):
     JUMP = Task("逛一逛支付宝农场", 0, 1, None, "点击去逛+600", Rect(0, 0, 10, 10))
 
     def test_caption_marks_jump_and_keeps_unsupported_tasks_out(self):
-        self.assertEqual(self.JUMP.kind, "jump")
-        self.assertTrue(Task("逛一逛蚂蚁庄园", 0, 1, None, "逛一逛蚂蚁庄园+600", None).jump)
-        self.assertTrue(Task("去芝麻信用涨分攒进度", 0, 1, None, "点击去逛+600", None).jump)
+        self.assertEqual(self.JUMP.kind, "open")
+        self.assertEqual(Task("逛一逛蚂蚁庄园", 0, 1, None, "逛一逛蚂蚁庄园+600", None).kind, "open")
+        self.assertEqual(Task("去芝麻信用涨分攒进度", 0, 1, None, "点击去逛+600", None).kind, "open")
         for title, detail in (("天猫积分换能量", "每300天猫积分兑换+1500"),
                               ("下载XX领能量", "点击去逛+600")):
             self.assertFalse(Task(title, 0, 1, None, detail, None).supported)
@@ -368,19 +394,26 @@ class JumpTaskTests(unittest.TestCase):
         adb.launch_taobao.assert_called_once()
         adb.input.assert_not_called()
 
-    def test_back_keys_are_only_a_fallback_when_taobao_never_returns(self):
+    def test_back_is_pressed_only_inside_taobao_when_the_launching_page_is_still_on_top(self):
+        # Observed on device: 闲鱼 opens through a Taobao webview, so resuming Taobao
+        # lands on that webview and one back press returns to the task list.
         adb = Mock(control=Control())
-        adb.foreground.side_effect = ["com.sina.weibo", "com.sina.weibo", "com.sina.weibo", PACKAGE]
-        external = Snapshot('<hierarchy><node text="微博" bounds="[0,0][100,100]" /></hierarchy>',
-                            "com.sina.weibo", 1200, 2670)
+        adb.foreground.return_value = PACKAGE
+        webview = Snapshot('<hierarchy><node text="闲鱼币狂欢" bounds="[0,0][100,100]" /></hierarchy>',
+                           PACKAGE, 1200, 2670)
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
             now = [0.0]
             runner.control.clock = lambda: now[0]
             runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
-            runner.observe = Mock(side_effect=[external] * 7 + [page([("逛一逛支付宝农场", 0, 1, 900)], 47)])
-            self.assertTrue(runner.jump_back("逛一逛支付宝农场").is_list)
-        adb.launch_taobao.assert_called_once()
+            frames = {"seen": 0}
+            def observe(external=False):
+                frames["seen"] += 1
+                # The list only appears once the back press has been sent.
+                return page([("去闲鱼签到省钱", 1, 1, 900)], 50) if adb.input.called else webview
+            runner.observe = Mock(side_effect=observe)
+            self.assertTrue(runner.jump_back("去闲鱼签到省钱").is_list)
+        adb.launch_taobao.assert_not_called()
         self.assertEqual(adb.input.call_args_list[0].args[1:], ("keyevent", "4"))
 
     def test_global_counter_alone_decides_success(self):
@@ -391,30 +424,96 @@ class JumpTaskTests(unittest.TestCase):
             runner.control.clock = lambda: now[0]
             runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
             runner.tap_task = Mock(return_value=(self.JUMP, 46))
-            runner.jump_enter = Mock(return_value="com.eg.android.AlipayGphone")
+            runner.await_target = Mock(return_value="com.eg.android.AlipayGphone")
             runner.observe = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 46))
             runner.jump_back = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 46))
-            failed = runner.execute_jump("逛一逛支付宝农场")
+            failed = runner.execute_one("逛一逛支付宝农场")
             self.assertFalse(failed.success)
             self.assertIn("总进度", failed.reason)
             self.assertEqual(runner.results, [])
             runner.jump_back = Mock(return_value=page([("逛一逛支付宝农场", 1, 1, 900)], 47))
-            self.assertTrue(runner.execute_jump("逛一逛支付宝农场").success)
+            self.assertTrue(runner.execute_one("逛一逛支付宝农场").success)
 
-    def test_failed_jump_is_not_retried_in_the_same_session(self):
+    def test_daily_cap_uses_the_cleared_row_as_weak_evidence(self):
+        # 50/50 cannot move, so a consumed row is the only remaining evidence.
+        adb = Mock(control=Control())
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.tap_task = Mock(return_value=(self.JUMP, 50))
+            runner.await_target = Mock(return_value="com.eg.android.AlipayGphone")
+            runner.observe = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 50))
+            runner.jump_back = Mock(return_value=page([("其他新任务", 0, 1, 900)], 50))
+            result = runner.execute_one("逛一逛支付宝农场")
+        self.assertTrue(result.success)
+        self.assertIn("弱证据", result.reason)
+
+    def test_daily_cap_never_accepts_an_untouched_row(self):
+        adb = Mock(control=Control())
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.tap_task = Mock(return_value=(self.JUMP, 50))
+            runner.await_target = Mock(return_value="com.eg.android.AlipayGphone")
+            runner.observe = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 50))
+            runner.jump_back = Mock(return_value=page([("逛一逛支付宝农场", 0, 1, 900)], 50))
+            self.assertFalse(runner.execute_one("逛一逛支付宝农场").success)
+
+    def test_failed_task_is_retried_once_then_left_alone(self):
         adb = Mock(control=Control())
         adb.lease.side_effect = lambda: nullcontext()
         adb.control.wait = Mock()
+        adb.foreground.return_value = PACKAGE
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
             runner.scan = Mock()
-            runner.discover = Mock(side_effect=[self.JUMP, None])
+            runner.discover = Mock(side_effect=[self.JUMP, self.JUMP, None])
             runner.find = Mock(return_value=(page([("逛一逛支付宝农场", 0, 1, 900)]), self.JUMP, False))
-            runner.execute_jump = Mock(return_value=Result(self.JUMP.title, 0, None, False, "no"))
+            runner.execute_one = Mock(return_value=Result(self.JUMP.title, 0, None, False, "no"))
             runner.run([], all_browse=True)
-        self.assertEqual(runner.discover.call_count, 2)
+        self.assertEqual(runner.execute_one.call_count, 2)
         self.assertIn(self.JUMP.title, runner.skip)
 
+    def test_unusable_task_does_not_end_the_session(self):
+        adb = Mock(control=Control())
+        adb.lease.side_effect = lambda: nullcontext()
+        adb.control.wait = Mock()
+        adb.foreground.return_value = PACKAGE
+        other = Task("看看#新商品", 0, 10, 15, "浏览15秒+400", None)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            runner.scan = Mock()
+            runner.discover = Mock(side_effect=[self.JUMP, other, None])
+            runner.find = Mock(side_effect=lambda title: (None, self.JUMP if title == self.JUMP.title else other, False))
+            runner.observe = Mock(return_value=page([(other.title, 0, 10, 900)], 50))
+            runner.execute_one = Mock(side_effect=[TaskFailed("点击后仍停留在任务列表"), Result(other.title, 0, 1, True, "ok")])
+            runner.run([], all_browse=True)
+        self.assertEqual(runner.execute_one.call_count, 2)
+        self.assertEqual(runner.execute_one.call_args_list[1].args[0], other.title)
+        self.assertEqual(runner.failures.get(self.JUMP.title), 1)
+
+
+    def test_external_switch_after_the_tap_is_finished_as_a_jump(self):
+        # The real 闲鱼 run stopped here: the caption looked in-app, then the app switched.
+        adb = Mock(control=Control())
+        external = Snapshot('<hierarchy><node text="闲鱼" bounds="[0,0][100,100]" /></hierarchy>',
+                            "com.taobao.idlefish", 1200, 2670)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.tap_task = Mock(return_value=(self.JUMP, 46))
+            runner.await_target = Mock(return_value="")
+            runner.observe = Mock(return_value=external)
+            runner.jump_back = Mock(return_value=page([("其他新任务", 0, 1, 900)], 47))
+            result = runner.execute_one("逛一逛支付宝农场")
+        self.assertTrue(result.success)
+        self.assertIn("com.taobao.idlefish", result.reason)
 
     def test_generic_reward_panel_is_recognised_on_an_unknown_activity_page(self):
         root = ET.Element("hierarchy")
@@ -469,6 +568,80 @@ class JumpTaskTests(unittest.TestCase):
             runner.back = Mock(return_value=page([("看看#依视路", 10, 10, 900)], 50))
             self.assertTrue(runner.execute_one("去省钱卡领红包").success)
             self.assertEqual(runner.page, "timed")
+
+    def test_activity_page_with_a_countdown_is_still_browsed_by_timer(self):
+        # The 闪购 page changes every second; identical frames can never be required.
+        adb = Mock(control=Control())
+        task = Task("领闪购红包下单直接省", 0, 1, None, "点击去逛+600", None)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.observe = Mock(side_effect=[shop_page("42"), shop_page("22"), shop_page("02")])
+            runner.enter(task)
+        self.assertEqual(runner.page, "timed")
+
+    def test_download_page_is_skipped_permanently(self):
+        adb = Mock(control=Control())
+        task = Task("去快手打卡领手机", 0, 1, None, "点击去逛+600", None)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            runner.observe = Mock(return_value=app_store())
+            with self.assertRaises(TaskFailed) as caught:
+                runner.enter(task)
+        self.assertTrue(caught.exception.permanent)
+
+    def test_app_store_page_needs_all_of_its_markers(self):
+        self.assertTrue(app_store().app_store_page())
+        self.assertFalse(feed().app_store_page())
+        self.assertFalse(immersive().app_store_page())
+
+
+class InstalledAppTests(unittest.TestCase):
+    """Taobao requires many apps; a task whose app is absent only opens a download page."""
+
+    def tearDown(self):
+        model.set_installed(None)
+
+    def test_task_is_skipped_only_when_its_app_cannot_be_opened(self):
+        model.set_installed(["com.smile.gifmaker", "com.baidu.searchbox"])
+        for title in ("去快手打卡领手机", "去百度App领现金"):
+            self.assertEqual(Task(title, 0, 1, None, "点击去逛+600", None).kind, "open")
+        lite = Task("去百度极速版领现金", 0, 1, None, "去百度极速版领现金+600", None)
+        self.assertFalse(lite.supported)
+        self.assertIn("百度极速版", lite.skip_reason)
+
+    def test_missing_app_is_named_in_the_skip_reason(self):
+        model.set_installed([])
+        task = Task("去快手打卡领手机", 0, 1, None, "点击去逛+600", None)
+        self.assertFalse(task.supported)
+        self.assertIn("快手", task.skip_reason)
+
+    def test_unknown_device_state_never_blocks_a_task(self):
+        model.set_installed(None)
+        self.assertEqual(Task("去快手打卡领手机", 0, 1, None, "点击去逛+600", None).kind, "open")
+
+
+class RecoveryTests(unittest.TestCase):
+    def test_foreground_stolen_between_tasks_is_recovered_without_stopping(self):
+        # Observed after two jumps to 百度: it resumed itself during the reading pause.
+        adb = Mock(control=Control())
+        adb.foreground.side_effect = ["com.baidu.searchbox", PACKAGE]
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            runner.jump_back = Mock(return_value=page([], 50))
+            runner.ensure_front()
+        runner.jump_back.assert_called_once()
+
+    def test_nothing_is_launched_while_taobao_is_already_in_front(self):
+        adb = Mock(control=Control())
+        adb.foreground.return_value = PACKAGE
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            runner.jump_back = Mock()
+            runner.ensure_front()
+        runner.jump_back.assert_not_called()
 
 
 if __name__ == "__main__":

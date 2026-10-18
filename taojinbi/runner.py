@@ -9,13 +9,18 @@ from pathlib import Path
 from typing import Callable
 
 from .adb import Adb, ROOT
-from .model import (PACKAGE, Halt, Rect, RefreshRequired, Snapshot, Stopped, Task,
-                    TaskChanged, supported_title)
+from .model import (PACKAGE, Halt, JumpDetected, Rect, RefreshRequired, Snapshot, Stopped,
+                    Task, TaskChanged, TaskFailed, set_installed, supported_title)
 
 # A jump task grants its reward on entry, so it only needs the external app to appear.
 JUMP_DWELL = 2.0
 JUMP_LAUNCH_TIMEOUT = 20
 BACK_ATTEMPTS = 3
+# A task that cannot be confirmed twice is left alone for the rest of the session.
+MAX_TASK_FAILURES = 2
+# An unknown in-app page is accepted after this many consecutive frames; its text keeps
+# moving (countdowns, prices), so identical frames can never be required.
+UNKNOWN_PAGE_FRAMES = 3
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,7 @@ class Runner:
         self.search_query = search_query
         self.searched = False
         self.skip: set[str] = set()
+        self.failures: dict[str, int] = {}
         self.ambiguous: set[str] = set()
 
     def log(self, message: str, **data):
@@ -142,6 +148,7 @@ class Runner:
 
     def _scan(self) -> list[Task]:
         self.state("正在读取任务列表")
+        set_installed(self.adb.packages())
         s = self.observe()
         self.list_only(s)
         tasks = s.tasks()
@@ -236,7 +243,7 @@ class Runner:
             if not task.supported or not task.button:
                 raise Halt(f"任务无法执行：{title}")
             if not task.button.valid(s.width, s.height):
-                raise Halt("任务按钮不可见，需要重新扫描")
+                raise TaskFailed("任务按钮不可见，需要重新扫描")
             x, y = task.button.center
             return ["tap", str(x), str(y)]
         s = self.action("list", build, title)
@@ -248,41 +255,50 @@ class Runner:
     def enter(self, task: Task) -> Snapshot:
         self.searched = False
         deadline = self.control.clock() + 30
-        previous, stable = "", 0
+        unknown = 0
         while self.control.clock() < deadline:
-            s = self.observe()
+            # Read leniently: the app may switch between the tap and this frame, and that
+            # switch is a jump to be finished, not a reason to stop the session.
+            s = self.observe(external=True)
+            if s.package != PACKAGE:
+                raise JumpDetected(s.package)
             kind = s.page_kind()
+            if kind == "list":
+                # The tap did not leave the list: never click the row a second time.
+                raise TaskFailed("点击后仍停留在任务列表，本次跳过")
             if kind in ("search", "web_search") and not self.searched:
                 self.start_search(kind)
                 self.searched = True
                 continue
             if kind in ("overlay", "feed", "guide", "main_search"):
                 if not s.task_in_progress(task) and not s.task_completed(task):
-                    raise Halt("目标页任务组件与本次浏览要求不符")
+                    raise TaskFailed("目标页任务组件与本次浏览要求不符")
                 self.page = kind
                 self.started_signal = s.task_in_progress(task)
                 self.finished_signal = False
                 self.log("已识别浏览页面", page=kind, task=task.title)
                 self.adb.screenshot(self.directory / "entered.png")
                 return s
-            if kind is None and not s.is_list and s.texts:
-                # Some activity pages carry no reward component; a settled page is enough.
-                signature = "".join(s.texts)[:200]
-                stable = stable + 1 if signature == previous else 0
-                previous = signature
-                if stable >= 2:
+            if s.app_store_page():
+                raise TaskFailed("该任务要求下载安装 APP，本次跳过", permanent=True)
+            if kind is None and s.texts:
+                # Some activity pages carry no reward component. Their text keeps moving
+                # (countdowns, prices), so the page is accepted after it has stayed
+                # unknown for a few frames instead of requiring identical frames.
+                unknown += 1
+                if unknown >= UNKNOWN_PAGE_FRAMES:
                     self.page = "timed"
                     self.started_signal = self.finished_signal = False
                     self.log("页面没有奖励组件，按计时浏览处理", task=task.title, seconds=task.seconds)
                     self.adb.screenshot(self.directory / "entered.png")
                     return s
             else:
-                previous, stable = "", 0
+                unknown = 0
             if not s.is_list:
                 # Allow loading placeholders, but never interact with unknown pages.
                 self.log("等待目标页加载")
             self.control.wait(2)
-        raise Halt("30秒内没有确认目标浏览页；未重复点击")
+        raise TaskFailed("30秒内没有确认目标浏览页；未重复点击")
 
     def execute_timed(self, task: Task, before_total: int | None) -> Result:
         """Stay on the activity page for its stated duration, then verify by the global counter."""
@@ -293,25 +309,11 @@ class Runner:
             self.control.wait(random.uniform(2, 4))
             s = self.observe()
             if s.is_list:
-                raise Halt("计时浏览期间已回到任务列表，已停止")
+                raise TaskFailed("计时浏览期间已回到任务列表，本次跳过")
         self.adb.screenshot(self.directory / "before-return.png")
         s = self.back("timed", "list", task.title)
-        deadline = self.control.clock() + 15
-        while True:
-            if before_total is not None and s.progress == before_total + 1:
-                result = Result(task.title, task.done, None, True,
-                                "计时浏览后总进度增加1；页面无奖励组件，单项次数未归因")
-                self.results.append(result)
-                self.log("任务完成", **asdict(result), global_progress=s.progress)
-                self.emit("result", result)
-                self.emit("tasks", s.tasks())
-                self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
-                return result
-            if self.control.clock() >= deadline:
-                raise Halt(f"“{task.title}”的进度没有确认增加，已停止；不会自动重做")
-            self.control.wait(2)
-            s = self.observe()
-            self.list_only(s)
+        return self.verify_completion(task, before_total, s,
+                                      "计时浏览后总进度增加1；页面无奖励组件，单项次数未归因")
 
     def start_search(self, kind: str = "search"):
         self.state("提交商品搜索词，等待浏览任务组件")
@@ -428,34 +430,79 @@ class Runner:
     def execute_one(self, title: str) -> Result:
         self.state(f"准备进入：{title}")
         before, before_total = self.tap_task(title)
-        self.enter(before)
+        try:
+            package = self.await_target()
+            if package:
+                return self.finish_jump(before, before_total, package)
+            self.enter(before)
+        except JumpDetected as exc:
+            # The caption never said "jump", but the device did.
+            self.log("识别到外部应用，改为跳转处理", task=title, package=exc.package)
+            return self.finish_jump(before, before_total, exc.package)
         if self.page == "timed":
             return self.execute_timed(before, before_total)
         self.browse(before)
         s = self.return_to_list(title)
+        return self.verify_browse(before, before_total, s)
+
+    def record_success(self, before: Task, s: Snapshot, reason: str) -> Result:
+        result = Result(before.title, before.done, None, True, reason)
+        self.results.append(result)
+        self.log("任务完成", **asdict(result), global_progress=s.progress)
+        self.emit("result", result)
+        self.emit("tasks", s.tasks())
+        self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
+        return result
+
+    def record_failure(self, before: Task, s: Snapshot | None,
+                       reason: str = "返回后总进度没有增加1") -> Result:
+        result = Result(before.title, before.done, None, False, reason)
+        self.log("任务未确认完成", **asdict(result),
+                 global_progress=s.progress if s is not None else None)
+        self.emit("task_failed", result)
+        return result
+
+    def counter_capped(self, s: Snapshot, before: Task, before_total: int | None) -> bool:
+        """At the daily cap the counter cannot move; a cleared row is all that is left."""
+        if not s.counter_full or s.progress != before_total:
+            return False
+        row = s.task(before.title)
+        return row is None or row.done > before.done
+
+    def verify_completion(self, before: Task, before_total: int | None, s: Snapshot,
+                          reason: str) -> Result:
+        deadline = self.control.clock() + 15
+        while True:
+            if before_total is not None and s.progress == before_total + 1:
+                return self.record_success(before, s, reason)
+            if self.counter_capped(s, before, before_total):
+                return self.record_success(before, s, "今日总进度已满，按任务行消失确认（弱证据）")
+            if self.control.clock() >= deadline:
+                return self.record_failure(before, s)
+            self.control.wait(2)
+            s = self.observe()
+            self.list_only(s)
+
+    def verify_browse(self, before: Task, before_total: int | None, s: Snapshot) -> Result:
         deadline = self.control.clock() + 15
         while True:
             advanced = advanced_task(before, self.baseline_tasks, s.tasks(), before_total, s.progress)
-            transition = completed_transition(self.started_signal, self.finished_signal, before_total, s.progress)
+            transition = completed_transition(self.started_signal, self.finished_signal,
+                                              before_total, s.progress)
             if advanced is not None or transition:
                 # Counter ambiguity is recorded explicitly; never borrow a different row's count.
-                count = advanced.done if advanced else None
                 reason = "任务进度已确认" if advanced else "页面从浏览中转为完成，且总进度增加1；单项次数未归因"
-                result = Result(title, before.done, count, True, reason)
-                if advanced and advanced.title != title:
-                    self.log("任务名称已轮换，次数变化唯一匹配", previous=title, current=advanced.title)
-                self.results.append(result)
-                self.log("任务完成", **asdict(result), global_progress=s.progress)
-                self.emit("result", result)
-                self.emit("tasks", s.tasks())
-                self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
-                return result
-            if self.control.clock() < deadline:
-                self.control.wait(2)
-                s = self.observe()
-                self.list_only(s)
-            else:
-                raise Halt(f"“{title}”的进度没有确认增加，已停止；不会自动重做")
+                if advanced and advanced.title != before.title:
+                    self.log("任务名称已轮换，次数变化唯一匹配",
+                             previous=before.title, current=advanced.title)
+                return self.record_success(before, s, reason)
+            if self.counter_capped(s, before, before_total):
+                return self.record_success(before, s, "今日总进度已满，按任务行消失确认（弱证据）")
+            if self.control.clock() >= deadline:
+                return self.record_failure(before, s)
+            self.control.wait(2)
+            s = self.observe()
+            self.list_only(s)
 
     def external_input(self, *args: str, title: str = ""):
         """Send one gesture while another app is in front; no page model is assumed."""
@@ -468,17 +515,23 @@ class Runner:
             except RefreshRequired:
                 self.control.checkpoint()
 
-    def jump_enter(self, title: str) -> str:
-        """Wait for the external app to take the foreground; its reward is granted on entry."""
+    def await_target(self) -> str:
+        """Decide from the device, not the caption: an external package means a jump.
+
+        The caption is only a hint. ``去惊喜好物逛一逛`` stays inside Taobao while
+        ``看淘宝视频领红包`` leaves it, so the foreground package is the only reliable
+        signal. A snapshot taken during an app switch is read leniently so that the
+        package check cannot stop the session mid-transition.
+        """
         deadline = self.control.clock() + JUMP_LAUNCH_TIMEOUT
         while self.control.clock() < deadline:
-            package = self.adb.foreground()
-            if package and package != PACKAGE:
-                self.log("已跳转到外部应用", task=title, package=package)
-                self.adb.screenshot(self.directory / "jumped.png")
-                return package
+            s = self.observe(external=True)
+            if s.package and s.package != PACKAGE:
+                return s.package
+            if not s.is_list:
+                return ""
             self.control.wait(1)
-        raise Halt("点击去完成后没有确认外部应用到前台")
+        raise TaskFailed("点击去完成后没有确认目标页面，本次跳过")
 
     def resume_taobao(self):
         """Never relaunch while Taobao is already in front: Welcome would start a new
@@ -488,59 +541,76 @@ class Runner:
         self.state("拉起淘宝")
         self.adb.launch_taobao()
 
+    def settle_list(self, timeout: float) -> Snapshot | None:
+        deadline = self.control.clock() + timeout
+        while True:
+            s = self.observe(external=True)
+            if s.package == PACKAGE and s.is_list:
+                return s
+            if self.control.clock() >= deadline:
+                return None
+            self.control.wait(1)
+
     def jump_back(self, title: str) -> Snapshot:
-        """Resume Taobao's own task; the external app's depth never has to be counted."""
+        """Resume Taobao's own task, then walk back to the list only inside Taobao.
+
+        ``am start`` resumes the existing task stack, but that stack may still be showing
+        the in-Taobao page that launched the external app (闲鱼 opens through a Taobao
+        webview), so a bounded back press is still needed. Back is never pressed while
+        another app is in front and never from the list itself, so the session cannot
+        fall through to the Taobao home page.
+        """
         self.state("从外部应用返回淘宝")
-        self.resume_taobao()
-        deadline = self.control.clock() + 10
+        deadline = self.control.clock() + 45
+        presses = 0
         while self.control.clock() < deadline:
-            s = self.observe(external=True)
-            if s.package == PACKAGE and s.is_list:
+            self.resume_taobao()
+            s = self.settle_list(8)
+            if s is not None:
                 return s
-            self.control.wait(2)
-        if self.adb.foreground() == PACKAGE:
-            raise Halt("已回到淘宝，但没有识别到任务列表，请手动返回列表后重新开始")
-        # Fallback only when the direct resume did not switch apps at all.
-        for _ in range(BACK_ATTEMPTS):
-            if self.adb.foreground() == PACKAGE:
-                break
+            if self.adb.foreground() != PACKAGE:
+                # The resume has not landed yet; pressing back here would only close
+                # the external app's own page.
+                self.control.wait(2)
+                continue
+            if presses >= BACK_ATTEMPTS:
+                raise Halt("已回到淘宝，但没有识别到任务列表，请手动返回列表后重新开始")
+            presses += 1
+            self.log("在淘宝内部返回一次", attempt=presses, task=title)
             self.external_input("keyevent", "4", title=title)
-            self.control.wait(2)
-        deadline = self.control.clock() + 10
-        while self.control.clock() < deadline:
-            s = self.observe(external=True)
-            if s.package == PACKAGE and s.is_list:
-                return s
             self.control.wait(2)
         raise Halt("从外部应用返回后没有回到任务列表")
 
-    def execute_jump(self, title: str) -> Result:
-        """Jump tasks leave no readable evidence outside Taobao; only the global counter counts."""
-        self.state(f"跳转执行：{title}")
-        before, before_total = self.tap_task(title)
-        package = self.jump_enter(title)
+    def finish_jump(self, before: Task, before_total: int | None, package: str) -> Result:
+        """A jump leaves no readable evidence outside Taobao; only the counter counts."""
+        self.log("已跳转到外部应用", task=before.title, package=package)
+        self.adb.screenshot(self.directory / "jumped.png")
         self.control.wait(JUMP_DWELL)
-        s = self.jump_back(title)
-        deadline = self.control.clock() + 15
-        while True:
-            if before_total is not None and s.progress == before_total + 1:
-                result = Result(title, before.done, None, True,
-                                f"跳转 {package} 后总进度增加1；单项次数未归因")
-                self.results.append(result)
-                self.log("任务完成", **asdict(result), global_progress=s.progress, package=package)
-                self.emit("result", result)
-                self.emit("tasks", s.tasks())
-                self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
-                return result
-            if self.control.clock() >= deadline:
-                break
-            self.control.wait(2)
-            s = self.observe()
-            self.list_only(s)
-        result = Result(title, before.done, None, False, "跳转后总进度没有增加1")
-        self.log("跳转任务未确认完成", **asdict(result), global_progress=s.progress, package=package)
-        self.emit("jump_failed", result)
-        return result
+        s = self.jump_back(before.title)
+        return self.verify_completion(before, before_total, s,
+                                      f"跳转 {package} 后总进度增加1；单项次数未归因")
+
+    def ensure_front(self):
+        """An app that grabs the foreground back must not end the session.
+
+        Observed after two jumps to 百度: the external app resumed itself during the
+        reading pause. Taobao's task stack is still intact, so resuming it is enough.
+        """
+        if self.adb.foreground() == PACKAGE:
+            return
+        self.state("前台不是淘宝，先恢复任务列表")
+        self.jump_back("恢复")
+
+    def recover_list(self, title: str):
+        """A failed task can leave the session on an unknown page; walk back to the list.
+
+        Only Taobao's own stack is unwound, and never from the list itself, so this
+        cannot fall through to the shop home page.
+        """
+        try:
+            self.jump_back(title)
+        except Halt as exc:
+            raise Halt(f"任务失败后无法回到任务列表：{exc}") from exc
 
     def run(self, titles: list[str], limit: int | None = None, all_browse: bool = False):
         with self.adb.lease():
@@ -557,6 +627,7 @@ class Runner:
             changes = 0
             while True:
                 pending = False
+                self.ensure_front()
                 if all_browse:
                     candidate = self.discover()
                     if candidate is None:
@@ -574,33 +645,37 @@ class Runner:
                         self.log("当前选定任务已耗尽或不在完整列表中", task=title)
                         continue
                     if not task.supported:
-                        raise Halt(f"该任务无法自动执行：{title}（{task.skip_reason}）")
-                    pending = True
-                    if task.jump:
-                        if not self.execute_jump(title).success:
-                            # One jump task is one shot; retrying it would only burn time.
-                            self.skip.add(title)
-                            self.state(f"“{title}”未确认完成，本轮跳过并继续")
-                            continue
-                        changes = 0
-                        if limit is not None and len(self.results) >= limit:
-                            self.state(f"达到本次上限：{len(self.results)} 项已完成")
-                            return
-                        self.state("任务间阅读间隔")
-                        self.control.wait(random.uniform(5, 10))
+                        # Uninstalled or excluded apps are a skip, not a reason to stop.
+                        self.log("任务不可自动执行，跳过", task=title, reason=task.skip_reason)
+                        self.skip.add(title)
                         continue
+                    pending = True
                     try:
-                        self.execute_one(title)
+                        result = self.execute_one(title)
                     except TaskChanged:
                         if not all_browse:
                             raise
                         changes += 1
                         if changes >= 5:
                             raise Halt("列表持续变化，尚未发送任务点击；请稍后重新扫描")
-                        self.log("点击前任务已变化，重新发现浏览任务")
+                        self.log("点击前任务已变化，重新发现任务")
                         pending = False
                         continue
+                    except TaskFailed as exc:
+                        # One unusable task must not end a session with tasks left.
+                        self.log("任务未执行，跳过", task=title, reason=str(exc))
+                        self.emit("task_failed", Result(title, task.done, None, False, str(exc)))
+                        if exc.permanent:
+                            self.skip.add(title)
+                        result = None
+                        self.recover_list(title)
                     changes = 0
+                    if result is None or not result.success:
+                        self.failures[title] = self.failures.get(title, 0) + 1
+                        if self.failures[title] >= MAX_TASK_FAILURES:
+                            self.skip.add(title)
+                            self.state(f"“{title}”连续{MAX_TASK_FAILURES}次未确认完成，本轮跳过并继续")
+                        continue
                     if limit is not None and len(self.results) >= limit:
                         self.state(f"达到本次上限：{len(self.results)} 项已完成")
                         return

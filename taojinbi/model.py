@@ -10,10 +10,54 @@ TASK_RE = re.compile(r"^(.+?)\((\d+)/(\d+)\)(.*)$")
 JUMP_RE = re.compile(r"^点击去逛|^逛一逛|跳转|打开\s*(?:APP|应用)", re.I)
 EXTERNAL_APP_RE = re.compile(r"支付宝|蚂蚁|芭芭|农场|领水果|京东|抖音|快手|拼多多|微信|闲鱼|饿了么|飞猪|高德|菜鸟|夸克|1688|钉钉|千问|淘特|阿里云盘|微博|百度", re.I)
 DOWNLOAD_RE = re.compile(r"下载|安装")
-# "看淘宝视频领红包" also says 点击去逛 but stays inside Taobao.
-IN_APP_RE = re.compile(r"淘宝")
 OTHER_RE = re.compile(r"邀请|好友|助力|兑换|积分|答题|考试|游戏|下单|购买|支付(?!宝)|开通|订阅|关注|收藏|加购|授权|拍照|上传")
 RISK_RE = re.compile(r"滑动.{0,8}验证|拖动.{0,8}滑块|请完成.{0,8}验证|请进行.{0,8}验证|安全验证|访问过于频繁|操作.{0,4}频繁|账号存在风险|账户存在风险|行为异常|身份验证|验证码|人机验证|网络开小差|网络异常|请检查网络")
+
+# Taobao sends users to many different apps. Opening a task whose app is not installed
+# only lands on a download page, so the caption is checked against the device once.
+APP_PACKAGES = {
+    "百度极速版": "com.baidu.searchbox.lite",
+    "快手极速版": "com.kuaishou.nebula",
+    "百度": "com.baidu.searchbox",
+    "快手": "com.smile.gifmaker",
+    "京东": "com.jingdong.app.mall",
+    "抖音": "com.ss.android.ugc.aweme",
+    "拼多多": "com.xunmeng.pinduoduo",
+    "微信": "com.tencent.mm",
+    "饿了么": "me.ele",
+    "飞猪": "com.taobao.trip",
+    "高德": "com.autonavi.minimap",
+    "菜鸟": "com.cainiao.wireless",
+    "夸克": "com.quark.browser",
+    "1688": "com.alibaba.wireless",
+    "钉钉": "com.alibaba.android.rimet",
+    "淘特": "com.taobao.mobile.wxt",
+    "阿里云盘": "com.alicloud.databox",
+    "闲鱼": "com.taobao.idlefish",
+    "天猫": "com.tmall.wireless",
+    "微博": "com.sina.weibo",
+}
+# Apps the user has ruled out even when they are installed.
+EXCLUDED_APPS = ("百度极速版",)
+# ``None`` means the device has not been read yet, so nothing is blocked.
+INSTALLED: set[str] | None = None
+
+
+def set_installed(packages) -> None:
+    global INSTALLED
+    INSTALLED = None if packages is None else {p.strip() for p in packages if p.strip()}
+
+
+def missing_app(label: str) -> str:
+    """Name the app a caption requires that this device cannot open."""
+    for name, package in APP_PACKAGES.items():
+        if name not in label:
+            continue
+        if name in EXCLUDED_APPS:
+            return name
+        if INSTALLED is not None and package not in INSTALLED:
+            return name
+    return ""
 
 
 class Halt(RuntimeError):
@@ -30,6 +74,23 @@ class RefreshRequired(Exception):
 
 class TaskChanged(Halt):
     """The list changed before any task input was sent."""
+
+
+class TaskFailed(Halt):
+    """One task could not be executed; the session itself is still usable."""
+
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        # A download page never turns into a browse task, so it is skipped at once.
+        self.permanent = permanent
+
+
+class JumpDetected(Exception):
+    """The page under observation turned out to be another app after all."""
+
+    def __init__(self, package: str):
+        super().__init__(package)
+        self.package = package
 
 
 @dataclass(frozen=True)
@@ -65,28 +126,25 @@ class Task:
 
     @property
     def kind(self) -> str:
-        """``browse``, ``jump``, or ``""`` when the task must be skipped."""
+        """``browse``, ``open`` (target unknown until tapped), or ``""`` to skip.
+
+        The detail line states the actual requirement; the title is marketing copy.
+        ``领闪购红包下单直接省`` reads like a purchase task but its requirement is
+        ``点击去逛``, so an explicit requirement always outranks the title wording.
+        """
         label = self.title + self.detail
-        if DOWNLOAD_RE.search(label) or OTHER_RE.search(label):
+        if DOWNLOAD_RE.search(label):
             return ""
-        if self.jump_marked:
-            return "jump"
+        if missing_app(label):
+            return ""
+        explicit = self.seconds is not None or bool(JUMP_RE.search(self.detail))
+        if OTHER_RE.search(self.detail) or (OTHER_RE.search(self.title) and not explicit):
+            return ""
         if self.seconds is not None and 0 < self.seconds <= 120:
             return "browse"
+        if explicit or JUMP_RE.search(self.title) or EXTERNAL_APP_RE.search(label):
+            return "open"
         return ""
-
-    @property
-    def jump_marked(self) -> bool:
-        """A jump opens another app; an in-app task may reuse the same caption."""
-        if EXTERNAL_APP_RE.search(self.title + self.detail):
-            return True
-        if IN_APP_RE.search(self.title):
-            return False
-        return bool(JUMP_RE.search(self.title) or JUMP_RE.search(self.detail))
-
-    @property
-    def jump(self) -> bool:
-        return self.kind == "jump"
 
     @property
     def supported(self) -> bool:
@@ -99,7 +157,10 @@ class Task:
         label = self.title + self.detail
         if DOWNLOAD_RE.search(label):
             return "需要下载安装，跳过"
-        if OTHER_RE.search(label):
+        missing = missing_app(label)
+        if missing:
+            return f"未安装或已排除 {missing}，跳过"
+        if OTHER_RE.search(self.detail) or OTHER_RE.search(self.title):
             return "非纯浏览任务跳过"
         return "非计时浏览任务跳过"
 
@@ -148,10 +209,21 @@ class Snapshot:
         return "做任务赚能量" in self.texts and "当前进度" in self.texts
 
     @property
-    def progress(self) -> int | None:
+    def progress_pair(self) -> tuple[int, int] | None:
         # The global progress is a separate text node. Task counters are embedded in titles.
-        values = [int(m.group(1)) for t in self.texts if (m := re.fullmatch(r"(\d+)/\d+", t))]
-        return values[0] if len(values) == 1 else None
+        pairs = [tuple(map(int, t.split("/"))) for t in self.texts if re.fullmatch(r"\d+/\d+", t)]
+        return pairs[0] if len(pairs) == 1 else None
+
+    @property
+    def progress(self) -> int | None:
+        pair = self.progress_pair
+        return pair[0] if pair else None
+
+    @property
+    def counter_full(self) -> bool:
+        """The daily energy cap is reached; no further task can raise the counter."""
+        pair = self.progress_pair
+        return bool(pair) and pair[0] >= pair[1]
 
     def check(self, external: bool = False):
         if not external:
@@ -262,6 +334,16 @@ class Snapshot:
 
     def panel_text(self) -> str:
         return self.reward_panel() or self.generic_panel()
+
+    def app_store_page(self) -> bool:
+        """Taobao's own app-detail page: the task wants an install, not a visit.
+
+        Observed for ``去快手打卡领手机`` even though 快手 is installed: the row opens
+        快手's download page (版本/备案号/权限说明/下载32位兼容版) inside Taobao.
+        """
+        compact = re.sub(r"\s+", "", "".join(self.texts))
+        return ("权限说明" in compact and "隐私政策" in compact and
+                re.search(r"下载|版本[:：]\d", compact) is not None)
 
     def main_search_panel(self) -> str:
         panels = [n for n in self.nodes if n.get("class") == "android.webkit.WebView" and
@@ -377,16 +459,12 @@ class Snapshot:
 
 
 def supported_title(title: str) -> bool:
-    """Jump titles are executable too; only download and non-browse tasks are refused."""
-    return not DOWNLOAD_RE.search(title) and not OTHER_RE.search(title)
+    """A caption on its own only rules out downloads; the detail line decides the rest."""
+    return not DOWNLOAD_RE.search(title)
 
 
 def jump_title(title: str) -> bool:
-    if EXTERNAL_APP_RE.search(title):
-        return True
-    if IN_APP_RE.search(title):
-        return False
-    return bool(JUMP_RE.search(title))
+    return bool(JUMP_RE.search(title) or EXTERNAL_APP_RE.search(title))
 
 
 def reward_matches(task: Task, text: str, pattern: str) -> bool:

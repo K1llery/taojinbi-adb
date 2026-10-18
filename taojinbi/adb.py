@@ -145,6 +145,10 @@ class Adb:
         raw = self.run(["devices", "-l"]).decode("utf-8", "replace")
         return [line.split()[0] for line in raw.splitlines() if re.match(r"^\S+\s+device(?:\s|$)", line)]
 
+    def packages(self) -> list[str]:
+        raw = self.run(["shell", "pm", "list", "packages"]).decode("utf-8", "replace")
+        return [line.split(":", 1)[1] for line in raw.splitlines() if line.startswith("package:")]
+
     def dimensions(self) -> tuple[int, int]:
         if self.size is None:
             raw = self.run(["shell", "wm", "size"]).decode()
