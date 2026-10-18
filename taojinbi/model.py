@@ -10,6 +10,8 @@ TASK_RE = re.compile(r"^(.+?)\((\d+)/(\d+)\)(.*)$")
 JUMP_RE = re.compile(r"^点击去逛|^逛一逛|跳转|打开\s*(?:APP|应用)", re.I)
 EXTERNAL_APP_RE = re.compile(r"支付宝|蚂蚁|芭芭|农场|领水果|京东|抖音|快手|拼多多|微信|闲鱼|饿了么|飞猪|高德|菜鸟|夸克|1688|钉钉|千问|淘特|阿里云盘|微博|百度", re.I)
 DOWNLOAD_RE = re.compile(r"下载|安装")
+# "看淘宝视频领红包" also says 点击去逛 but stays inside Taobao.
+IN_APP_RE = re.compile(r"淘宝")
 OTHER_RE = re.compile(r"邀请|好友|助力|兑换|积分|答题|考试|游戏|下单|购买|支付(?!宝)|开通|订阅|关注|收藏|加购|授权|拍照|上传")
 RISK_RE = re.compile(r"滑动.{0,8}验证|拖动.{0,8}滑块|请完成.{0,8}验证|请进行.{0,8}验证|安全验证|访问过于频繁|操作.{0,4}频繁|账号存在风险|账户存在风险|行为异常|身份验证|验证码|人机验证|网络开小差|网络异常|请检查网络")
 
@@ -67,11 +69,20 @@ class Task:
         label = self.title + self.detail
         if DOWNLOAD_RE.search(label) or OTHER_RE.search(label):
             return ""
-        if JUMP_RE.search(self.title) or JUMP_RE.search(self.detail) or EXTERNAL_APP_RE.search(label):
+        if self.jump_marked:
             return "jump"
         if self.seconds is not None and 0 < self.seconds <= 120:
             return "browse"
         return ""
+
+    @property
+    def jump_marked(self) -> bool:
+        """A jump opens another app; an in-app task may reuse the same caption."""
+        if EXTERNAL_APP_RE.search(self.title + self.detail):
+            return True
+        if IN_APP_RE.search(self.title):
+            return False
+        return bool(JUMP_RE.search(self.title) or JUMP_RE.search(self.detail))
 
     @property
     def jump(self) -> bool:
@@ -121,6 +132,7 @@ class Snapshot:
             raise Halt(f"控件树解析失败：{exc}") from exc
         self.nodes = list(self.root.iter("node"))
         self.parents = {child: parent for parent in self.root.iter() for child in parent}
+        self.ambiguous: set[str] = set()
 
     @property
     def texts(self) -> list[str]:
@@ -160,7 +172,7 @@ class Snapshot:
     def tasks(self) -> list[Task]:
         if not self.is_list:
             return []
-        result: dict[str, Task] = {}
+        rows: list[Task] = []
         for node in self.nodes:
             text = node.get("text", "").strip()
             match = TASK_RE.fullmatch(text)
@@ -184,10 +196,30 @@ class Snapshot:
                     break
                 ancestor = self.parents.get(ancestor)
             duration = re.search(r"浏览\s*(\d+)\s*(?:秒|s)", detail, re.I)
-            task = Task(title, int(done), int(total), int(duration[1]) if duration else None, detail, button)
-            if title in result and result[title] != task:
-                raise Halt(f"任务名称存在歧义：{title}")
-            result[title] = task
+            rows.append(Task(title, int(done), int(total),
+                             int(duration[1]) if duration else None, detail, button))
+        return self._resolve(rows)
+
+    def _resolve(self, rows: list[Task]) -> list[Task]:
+        """A recycled row keeps a stale caption; never let it stop the session."""
+        self.ambiguous: set[str] = set()
+        grouped: dict[str, list[Task]] = {}
+        for task in rows:
+            grouped.setdefault(task.title, []).append(task)
+        result: dict[str, Task] = {}
+        for title, candidates in grouped.items():
+            if len(candidates) == 1:
+                result[title] = candidates[0]
+                continue
+            # The stale row repeats a counter that another row still owns.
+            shared = {(t.done, t.total) for t in rows if t.title != title}
+            pool = [t for t in candidates if (t.done, t.total) not in shared] or candidates
+            top = max(t.done for t in pool)
+            winners = [t for t in pool if t.done == top]
+            if len(winners) == 1:
+                result[title] = winners[0]
+            else:
+                self.ambiguous.add(title)
         return list(result.values())
 
     def task(self, title: str) -> Task | None:
@@ -214,6 +246,23 @@ class Snapshot:
             return ""
         return re.sub(r"\s+", "", "".join(n.get("text", "") for n in panels[0].iter("node") if self.visible(n)))
 
+    def generic_panel(self) -> str:
+        """A floating component that states a browse timer and its reward, on any activity page."""
+        for node in self.nodes:
+            if not self.visible(node):
+                continue
+            rect = Rect.parse(node.get("bounds", ""))
+            if rect.bottom - rect.top > self.height * .55 or rect.right - rect.left > self.width * .95:
+                continue
+            text = re.sub(r"\s+", "", "".join(n.get("text", "") for n in node.iter("node")
+                                              if self.visible(n)))
+            if re.search(r"浏览\d+秒", text) and re.search(r"已?得\d+", text):
+                return text
+        return ""
+
+    def panel_text(self) -> str:
+        return self.reward_panel() or self.generic_panel()
+
     def main_search_panel(self) -> str:
         panels = [n for n in self.nodes if n.get("class") == "android.webkit.WebView" and
                   n.get("text") == "五棱镜浮标 - 主搜专用"]
@@ -226,7 +275,7 @@ class Snapshot:
             return "list"
         if self.main_search_panel():
             return "main_search"
-        panel = self.reward_panel()
+        panel = self.panel_text()
         if panel and re.search(r"浏览\d+秒|任务已完成", panel):
             return "overlay"
         if any(t in self.texts for t in ("体力-固推&自建feeds-interact", "体力-固搜-interact")) and self.header_text():
@@ -280,7 +329,7 @@ class Snapshot:
     def task_completed(self, task: Task) -> bool:
         kind = self.page_kind()
         if kind == "overlay":
-            panel = self.reward_panel()
+            panel = self.panel_text()
             return "任务已完成" in panel and reward_matches(task, panel, r"已得(\d+)")
         if kind == "feed":
             return reward_matches(task, self.header_text(), r"已得(\d+)")
@@ -294,7 +343,7 @@ class Snapshot:
 
     def task_in_progress(self, task: Task) -> bool:
         if self.page_kind() == "overlay":
-            panel = self.reward_panel()
+            panel = self.panel_text()
             return (f"浏览{task.seconds}秒" in panel and
                     reward_matches(task, panel, rf"浏览{task.seconds}秒得(\d+)") and not self.task_completed(task))
         if self.page_kind() == "feed":
@@ -333,7 +382,11 @@ def supported_title(title: str) -> bool:
 
 
 def jump_title(title: str) -> bool:
-    return bool(JUMP_RE.search(title) or EXTERNAL_APP_RE.search(title))
+    if EXTERNAL_APP_RE.search(title):
+        return True
+    if IN_APP_RE.search(title):
+        return False
+    return bool(JUMP_RE.search(title))
 
 
 def reward_matches(task: Task, text: str, pattern: str) -> bool:

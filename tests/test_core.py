@@ -94,9 +94,17 @@ class ParsingTests(unittest.TestCase):
         refreshed = Snapshot(ET.tostring(s.root, encoding="unicode"), PACKAGE, 1200, 2670)
         self.assertIsNone(refreshed.task("好物沉浸看").button)
 
-    def test_ambiguous_title_halts(self):
-        with self.assertRaises(Halt):
-            page([("好物沉浸看", 0, 5, 900), ("好物沉浸看", 0, 5, 1200)]).tasks()
+    def test_duplicate_rows_are_dropped_instead_of_stopping_the_session(self):
+        s = page([("好物沉浸看", 0, 5, 900), ("好物沉浸看", 0, 5, 1200)])
+        self.assertEqual(s.tasks(), [])
+        self.assertEqual(s.ambiguous, {"好物沉浸看"})
+
+    def test_stale_caption_loses_to_the_counter_another_row_owns(self):
+        s = page([("搜一搜你心仪的宝贝", 3, 10, 900), ("看看#隔离霜", 3, 10, 1200),
+                  ("搜一搜你心仪的宝贝", 4, 5, 1500)])
+        task = s.task("搜一搜你心仪的宝贝")
+        self.assertEqual((task.done, task.total), (4, 5))
+        self.assertEqual(s.ambiguous, set())
 
     def test_risk_text_and_description_halt(self):
         for attr in ("text", "content-desc"):

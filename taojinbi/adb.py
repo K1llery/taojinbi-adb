@@ -155,11 +155,11 @@ class Adb:
         return self.size
 
     def foreground(self) -> str:
+        """Return the resumed package, or "" while the system has not settled yet."""
         activity = self.run(["shell", "dumpsys", "activity", "activities"]).decode("utf-8", "replace")
-        match = re.search(r"(?:topResumedActivity|mResumedActivity)\s*[=:].*?\s([\w.]+)/", activity)
-        if not match:
-            raise Halt("无法确认前台应用")
-        return match[1]
+        match = re.search(r"(?:topResumedActivity|mResumedActivity|ResumedActivity)\s*[=:].*?\s([\w.]+)/",
+                          activity)
+        return match[1] if match else ""
 
     def launch_taobao(self):
         self.run(["shell", "am", "start", "-n", f"{PACKAGE}/com.taobao.tao.welcome.Welcome"])
@@ -178,7 +178,10 @@ class Adb:
         classpath = f"/system/framework/android.test.runner.jar:/system/framework/uiautomator.jar:{self.reader_path}"
         xml = self.run(["shell", "ANDROID_DATA=/data/local/tmp", f"CLASSPATH={classpath}",
                         "app_process", "/system/bin", "UiDump"], timeout=15).decode("utf-8", "replace")
-        return Snapshot(xml, self.foreground(), *self.dimensions(), epoch=epoch)
+        package = self.foreground()
+        if not package:
+            raise Halt("无法确认前台应用")
+        return Snapshot(xml, package, *self.dimensions(), epoch=epoch)
 
     def input(self, snapshot: Snapshot, *args: str):
         self.run(["shell", "input", *args], epoch=snapshot.epoch)

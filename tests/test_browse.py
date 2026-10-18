@@ -416,5 +416,60 @@ class JumpTaskTests(unittest.TestCase):
         self.assertIn(self.JUMP.title, runner.skip)
 
 
+    def test_generic_reward_panel_is_recognised_on_an_unknown_activity_page(self):
+        root = ET.Element("hierarchy")
+        window = node(root)
+        node(window, "淘宝闪购")
+        panel = node(window, "", "[120,1900][1080,2260]")
+        node(panel, "浏览15秒", "[700,1950][900,2010]")
+        node(panel, "得400", "[700,2010][900,2070]")
+        s = Snapshot(ET.tostring(root, encoding="unicode"), PACKAGE, 1200, 2670)
+        self.assertEqual(s.page_kind(), "overlay")
+        self.assertTrue(s.task_in_progress(Task("逛逛闪购", 0, 5, 15, "浏览15秒+400", None)))
+        self.assertFalse(s.task_completed(Task("逛逛闪购", 0, 5, 15, "浏览15秒+400", None)))
+
+    def test_generic_panel_never_hijacks_the_feed_header(self):
+        self.assertEqual(feed().page_kind(), "feed")
+        self.assertEqual(feed(True).page_kind(), "feed")
+
+    def test_back_never_relaunches_taobao_from_inside_taobao(self):
+        adb = Mock(control=Control())
+        unknown = Snapshot('<hierarchy><node text="车库页" bounds="[0,0][100,100]" /></hierarchy>',
+                           PACKAGE, 1200, 2670)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.observe = Mock(return_value=unknown)
+            runner.action = Mock()
+            with self.assertRaises(Halt):
+                runner.back("overlay", "list", "逛逛活动页")
+        adb.launch_taobao.assert_not_called()
+
+    def test_resume_taobao_is_skipped_when_taobao_is_already_in_front(self):
+        adb = Mock(control=Control())
+        adb.foreground.return_value = PACKAGE
+        with tempfile.TemporaryDirectory() as folder:
+            Runner(adb, directory=Path(folder)).resume_taobao()
+        adb.launch_taobao.assert_not_called()
+
+    def test_activity_page_without_reward_component_is_browsed_by_timer(self):
+        adb = Mock(control=Control())
+        garage = Snapshot('<hierarchy><node text="车库页" bounds="[0,0][1200,2600]" /></hierarchy>',
+                          PACKAGE, 1200, 2670)
+        task = Task("去省钱卡领红包", 0, 1, 5, "浏览5秒+600", None)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Runner(adb, directory=Path(folder))
+            now = [0.0]
+            runner.control.clock = lambda: now[0]
+            runner.control.wait = Mock(side_effect=lambda s: now.__setitem__(0, now[0] + s))
+            runner.observe = Mock(return_value=garage)
+            runner.tap_task = Mock(return_value=(task, 49))
+            runner.back = Mock(return_value=page([("看看#依视路", 10, 10, 900)], 50))
+            self.assertTrue(runner.execute_one("去省钱卡领红包").success)
+            self.assertEqual(runner.page, "timed")
+
+
 if __name__ == "__main__":
     unittest.main()

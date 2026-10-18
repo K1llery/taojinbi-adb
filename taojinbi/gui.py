@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+import winsound
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
@@ -39,10 +40,15 @@ class App:
         self.counter = tk.StringVar(value="本次确认完成 0 项")
         self.limit = tk.StringVar(value="0")
         self.all_browse = tk.BooleanVar(value=True)
+        self.notify_sound = tk.BooleanVar(value=True)
+        self.notify_toast = tk.BooleanVar(value=True)
+        self.toast_window: tk.Toplevel | None = None
         try:
             settings = json.loads((ROOT / ".local-settings.json").read_text(encoding="utf-8"))
             self.adb_path.set(settings.get("adb", default_adb()))
             self.serial.set(settings.get("serial", ""))
+            self.notify_sound.set(bool(settings.get("beep", True)))
+            self.notify_toast.set(bool(settings.get("toast", True)))
         except (OSError, ValueError):
             pass
         self.build()
@@ -97,6 +103,12 @@ class App:
         self.limit_box = ttk.Spinbox(controls, from_=0, to=50, textvariable=self.limit, width=5)
         self.limit_box.pack(side="left")
         ttk.Label(controls, textvariable=self.counter).pack(side="right")
+        notify = ttk.Frame(outer)
+        notify.pack(fill="x", pady=(10, 0))
+        ttk.Label(notify, text="完成提醒").pack(side="left")
+        ttk.Checkbutton(notify, text="响铃", variable=self.notify_sound).pack(side="left", padx=(10, 14))
+        ttk.Checkbutton(notify, text="置顶提示（3 秒后自动消失）",
+                        variable=self.notify_toast).pack(side="left")
         ttk.Label(outer, textvariable=self.status, wraplength=900).pack(anchor="w", fill="x", pady=(12, 6))
         self.logbox = tk.Text(outer, height=5, font=("Microsoft YaHei UI", 9), state="disabled", wrap="word")
         self.logbox.pack(fill="x")
@@ -172,9 +184,18 @@ class App:
         self.worker.start()
 
     def render_tasks(self, tasks):
+        previous = list(self.tasks.values())
         if not self.has_scanned:
             self.selected = {t.title for t in tasks if self.available(t)}
             self.has_scanned = True
+        else:
+            # A renamed slot keeps the user's choice; match it by its position in the list.
+            current = {t.title for t in tasks}
+            for index, old in enumerate(previous):
+                if old.title in self.selected and old.title not in current and index < len(tasks):
+                    renamed = tasks[index]
+                    if self.available(renamed):
+                        self.selected.add(renamed.title)
         self.tasks = {t.title: t for t in tasks}
         self.table.delete(*self.table.get_children())
         for task in tasks:
@@ -220,6 +241,40 @@ class App:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
+    def notify(self, title):
+        """Both reminders are opt-out; nothing here is forced on the user."""
+        if self.notify_sound.get():
+            try:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except RuntimeError:
+                pass
+        if self.notify_toast.get():
+            self.show_toast(title)
+
+    def show_toast(self, title):
+        self.close_toast()
+        window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        frame = ttk.Frame(window, padding=(16, 12), relief="solid", borderwidth=1)
+        frame.pack()
+        ttk.Label(frame, text=f"已完成：{title}", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(frame, text=f"本次累计 {self.completed} 项").pack(anchor="w")
+        window.update_idletasks()
+        x = self.root.winfo_rootx() + self.root.winfo_width() - window.winfo_width() - 24
+        y = self.root.winfo_rooty() + self.root.winfo_height() - window.winfo_height() - 24
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.toast_window = window
+        window.after(3000, self.close_toast)
+
+    def close_toast(self):
+        window, self.toast_window = self.toast_window, None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
     def drain(self):
         try:
             while True:
@@ -244,6 +299,7 @@ class App:
                 elif kind == "result":
                     self.completed += 1
                     self.counter.set(f"本次确认完成 {self.completed} 项")
+                    self.notify(value.title)
                 elif kind == "jump_failed":
                     self.add_log(f"跳转未完成：{value.title}（{value.reason}）")
                 elif kind == "error":
@@ -261,8 +317,11 @@ class App:
 
     def close(self):
         self.control.stop()
+        self.close_toast()
         (ROOT / ".local-settings.json").write_text(json.dumps(
-            {"adb": self.adb_path.get(), "serial": self.serial.get()}, ensure_ascii=False), encoding="utf-8")
+            {"adb": self.adb_path.get(), "serial": self.serial.get(),
+             "beep": self.notify_sound.get(), "toast": self.notify_toast.get()},
+            ensure_ascii=False), encoding="utf-8")
         # Give the worker's polling loop time to reap the active adb process.
         if self.worker and self.worker.is_alive():
             self.status.set("正在停止并关闭…")

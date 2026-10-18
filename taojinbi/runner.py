@@ -79,6 +79,7 @@ class Runner:
         self.search_query = search_query
         self.searched = False
         self.skip: set[str] = set()
+        self.ambiguous: set[str] = set()
 
     def log(self, message: str, **data):
         event = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -97,6 +98,9 @@ class Runner:
         self.steps += 1
         (self.directory / f"{self.steps:03d}.xml").write_text(s.xml, encoding="utf-8")
         s.check(external)
+        if s.ambiguous and s.ambiguous != self.ambiguous:
+            self.ambiguous = set(s.ambiguous)
+            self.log("同名任务行出现复用残留，本次不执行这些行", titles=sorted(s.ambiguous))
         return s
 
     def list_only(self, s: Snapshot):
@@ -115,6 +119,9 @@ class Runner:
             elif context in ("overlay", "feed", "guide", "product", "search", "main_search", "web_search"):
                 if s.page_kind() != context:
                     raise Halt(f"页面已变化，预期 {context}，已停止输入")
+            elif context == "timed":
+                if s.is_list:
+                    raise Halt("页面已变化，预期站内活动页，已停止输入")
             else:
                 self.browse_only(s, title)
             args = builder(s)
@@ -158,6 +165,9 @@ class Runner:
         s = self.observe()
         self.list_only(s)
         task = s.task(title)
+        if task is None and title in s.ambiguous:
+            # A stale duplicate row is still on screen; scrolling will not resolve it.
+            return s, None, False
         if task and not task.remaining:
             return s, task, False
         if task and task.button and task.button.valid(s.width, s.height):
@@ -238,6 +248,7 @@ class Runner:
     def enter(self, task: Task) -> Snapshot:
         self.searched = False
         deadline = self.control.clock() + 30
+        previous, stable = "", 0
         while self.control.clock() < deadline:
             s = self.observe()
             kind = s.page_kind()
@@ -254,11 +265,53 @@ class Runner:
                 self.log("已识别浏览页面", page=kind, task=task.title)
                 self.adb.screenshot(self.directory / "entered.png")
                 return s
+            if kind is None and not s.is_list and s.texts:
+                # Some activity pages carry no reward component; a settled page is enough.
+                signature = "".join(s.texts)[:200]
+                stable = stable + 1 if signature == previous else 0
+                previous = signature
+                if stable >= 2:
+                    self.page = "timed"
+                    self.started_signal = self.finished_signal = False
+                    self.log("页面没有奖励组件，按计时浏览处理", task=task.title, seconds=task.seconds)
+                    self.adb.screenshot(self.directory / "entered.png")
+                    return s
+            else:
+                previous, stable = "", 0
             if not s.is_list:
                 # Allow loading placeholders, but never interact with unknown pages.
                 self.log("等待目标页加载")
             self.control.wait(2)
         raise Halt("30秒内没有确认目标浏览页；未重复点击")
+
+    def execute_timed(self, task: Task, before_total: int | None) -> Result:
+        """Stay on the activity page for its stated duration, then verify by the global counter."""
+        seconds = task.seconds or 15
+        self.state(f"计时浏览：{task.title}（{seconds}秒，页面无奖励组件）")
+        deadline = self.control.clock() + seconds + 5
+        while self.control.clock() < deadline:
+            self.control.wait(random.uniform(2, 4))
+            s = self.observe()
+            if s.is_list:
+                raise Halt("计时浏览期间已回到任务列表，已停止")
+        self.adb.screenshot(self.directory / "before-return.png")
+        s = self.back("timed", "list", task.title)
+        deadline = self.control.clock() + 15
+        while True:
+            if before_total is not None and s.progress == before_total + 1:
+                result = Result(task.title, task.done, None, True,
+                                "计时浏览后总进度增加1；页面无奖励组件，单项次数未归因")
+                self.results.append(result)
+                self.log("任务完成", **asdict(result), global_progress=s.progress)
+                self.emit("result", result)
+                self.emit("tasks", s.tasks())
+                self.adb.screenshot(self.directory / f"completed-{len(self.results)}.png")
+                return result
+            if self.control.clock() >= deadline:
+                raise Halt(f"“{task.title}”的进度没有确认增加，已停止；不会自动重做")
+            self.control.wait(2)
+            s = self.observe()
+            self.list_only(s)
 
     def start_search(self, kind: str = "search"):
         self.state("提交商品搜索词，等待浏览任务组件")
@@ -376,6 +429,8 @@ class Runner:
         self.state(f"准备进入：{title}")
         before, before_total = self.tap_task(title)
         self.enter(before)
+        if self.page == "timed":
+            return self.execute_timed(before, before_total)
         self.browse(before)
         s = self.return_to_list(title)
         deadline = self.control.clock() + 15
@@ -418,17 +473,25 @@ class Runner:
         deadline = self.control.clock() + JUMP_LAUNCH_TIMEOUT
         while self.control.clock() < deadline:
             package = self.adb.foreground()
-            if package != PACKAGE:
+            if package and package != PACKAGE:
                 self.log("已跳转到外部应用", task=title, package=package)
                 self.adb.screenshot(self.directory / "jumped.png")
                 return package
             self.control.wait(1)
         raise Halt("点击去完成后没有确认外部应用到前台")
 
+    def resume_taobao(self):
+        """Never relaunch while Taobao is already in front: Welcome would start a new
+        activity and drop the task list back to the shop home page."""
+        if self.adb.foreground() == PACKAGE:
+            return
+        self.state("拉起淘宝")
+        self.adb.launch_taobao()
+
     def jump_back(self, title: str) -> Snapshot:
         """Resume Taobao's own task; the external app's depth never has to be counted."""
         self.state("从外部应用返回淘宝")
-        self.adb.launch_taobao()
+        self.resume_taobao()
         deadline = self.control.clock() + 10
         while self.control.clock() < deadline:
             s = self.observe(external=True)
