@@ -212,6 +212,54 @@ class Snapshot:
         return "做任务赚能量" in self.texts and "当前进度" in self.texts
 
     @property
+    def coin_home(self) -> bool:
+        return (self.package == PACKAGE and not self.is_list and "淘金币首页" in self.texts and
+                any(n.get("resource-id") == "hd_assets_coin_icon" for n in self.nodes))
+
+    @property
+    def shop_home(self) -> bool:
+        ids = {n.get("resource-id") for n in self.nodes if self.visible(n)}
+        return (self.package == PACKAGE and not self.is_list and
+                {f"{PACKAGE}:id/homepage_root_layout", f"{PACKAGE}:id/search_bar_container"} <= ids and
+                {"首页", "我的淘宝"} <= set(self.texts))
+
+    def coin_task_button(self) -> Rect | None:
+        if not self.coin_home:
+            return None
+        targets = []
+        for n in self.nodes:
+            if (n.get("resource-id") == "energy_task_button" and n.get("text") == "赚能量" and
+                    n.get("clickable") == "true" and n.get("enabled", "true") == "true" and
+                    n.get("visible-to-user", "true") == "true"):
+                r = Rect.parse(n.get("bounds", ""))
+                # The real button extends three pixels beyond the right screen edge.
+                clipped = Rect(max(0, r.left), max(0, r.top), min(self.width, r.right), min(self.height, r.bottom))
+                if clipped.valid(self.width, self.height):
+                    targets.append(clipped)
+        return targets[0] if len(targets) == 1 else None
+
+    @property
+    def coin_energy(self) -> int | None:
+        if self.package != PACKAGE or not (self.is_list or self.coin_home):
+            return None
+        values = []
+        for n in self.nodes:
+            if n.get("class") != "android.widget.Button" or not self.visible(n):
+                continue
+            match = re.fullmatch(r"升级中 松手开始加速升级 升级赛车拿钱 剩余 (\d+) 能量", n.get("text", ""))
+            if match:
+                values.append(int(match[1]))
+        return values[0] if len(values) == 1 else None
+
+    def coin_tasks_close(self) -> Rect | None:
+        if not self.is_list:
+            return None
+        buttons = [n for n in self.nodes if n.get("text") == "关闭" and
+                   n.get("class") == "android.widget.Button" and n.get("clickable") == "true" and
+                   n.get("enabled", "true") == "true" and self.visible(n)]
+        return Rect.parse(buttons[0].get("bounds", "")) if len(buttons) == 1 else None
+
+    @property
     def progress_pair(self) -> tuple[int, int] | None:
         # The global progress is a separate text node. Task counters are embedded in titles.
         pairs = [tuple(map(int, t.split("/"))) for t in self.texts if re.fullmatch(r"\d+/\d+", t)]

@@ -166,7 +166,15 @@ class Adb:
         return match[1] if match else ""
 
     def launch_taobao(self, epoch: int | None = None):
-        self.run(["shell", "am", "start", "-n", f"{PACKAGE}/com.taobao.tao.welcome.Welcome"], epoch=epoch)
+        self.run(["shell", "am", "start", "-a", "android.intent.action.MAIN", "-c",
+                  "android.intent.category.LAUNCHER", "-f", "0x10200000", "-n",
+                  f"{PACKAGE}/com.taobao.tao.welcome.Welcome"], epoch=epoch)
+
+    def open_coin_home(self, snapshot: Snapshot):
+        if not snapshot.shop_home:
+            raise Halt("未确认淘宝首页，未打开淘金币活动")
+        self.run(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d",
+                  "https://pages-fast.m.taobao.com/wow/z/tmtjb/town/home", "-p", PACKAGE], epoch=snapshot.epoch)
 
     def snapshot(self) -> Snapshot:
         self.control.checkpoint()
@@ -180,8 +188,15 @@ class Adb:
             self.run(["push", str(helper), remote])
             self.reader_path = remote
         classpath = f"/system/framework/android.test.runner.jar:/system/framework/uiautomator.jar:{self.reader_path}"
-        xml = self.run(["shell", "ANDROID_DATA=/data/local/tmp", f"CLASSPATH={classpath}",
-                        "app_process", "/system/bin", "UiDump"], timeout=15).decode("utf-8", "replace")
+        for attempt in range(3):
+            try:
+                xml = self.run(["shell", "ANDROID_DATA=/data/local/tmp", f"CLASSPATH={classpath}",
+                                "app_process", "/system/bin", "UiDump"], timeout=15).decode("utf-8", "replace")
+                break
+            except Halt as exc:
+                if "IllegalStateException: No active accessibility window" not in str(exc) or attempt == 2:
+                    raise
+                self.control.wait(.3)
         package = self.foreground()
         if not package:
             raise Halt("无法确认前台应用")
