@@ -119,7 +119,7 @@ class App:
         ttk.Label(controls, textvariable=self.counter).pack(side="right")
         notify = ttk.Frame(outer)
         notify.pack(fill="x", pady=(10, 0))
-        ttk.Label(notify, text="完成提醒").pack(side="left")
+        ttk.Label(notify, text="执行结束／故障提醒").pack(side="left")
         ttk.Checkbutton(notify, text="响铃", variable=self.notify_sound).pack(side="left", padx=(10, 14))
         ttk.Checkbutton(notify, text="置顶提示（3 秒后自动消失）",
                         variable=self.notify_toast).pack(side="left")
@@ -197,10 +197,14 @@ class App:
                     else:
                         self.messages.put(("reset_count", None))
                         runner.run(titles, limit=limit or None, all_browse=all_browse)
+                        if not control.stopped.is_set():
+                            self.messages.put(("run_finished", None))
             except Stopped:
                 self.messages.put(("state", "已停止"))
             except Exception as exc:
                 self.messages.put(("error", str(exc)))
+                if mode == "run":
+                    self.messages.put(("run_finished", str(exc)))
             finally:
                 self.messages.put(("idle", None))
         self.worker = threading.Thread(target=work, daemon=True)
@@ -255,7 +259,7 @@ class App:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
-    def notify(self, title):
+    def notify(self, title, detail=""):
         """Both reminders are opt-out; nothing here is forced on the user."""
         if self.notify_sound.get():
             try:
@@ -263,16 +267,18 @@ class App:
             except RuntimeError:
                 pass
         if self.notify_toast.get():
-            self.show_toast(title)
+            self.show_toast(title, detail)
 
-    def show_toast(self, title):
+    def show_toast(self, title, detail=""):
         self.close_toast()
         window = tk.Toplevel(self.root)
         window.overrideredirect(True)
         window.attributes("-topmost", True)
         frame = ttk.Frame(window, padding=(16, 12), relief="solid", borderwidth=1)
         frame.pack()
-        ttk.Label(frame, text=f"已完成：{title}", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(frame, text=title, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        if detail:
+            ttk.Label(frame, text=detail, wraplength=420).pack(anchor="w")
         ttk.Label(frame, text=f"本次累计 {self.completed} 项").pack(anchor="w")
         window.update_idletasks()
         x = self.root.winfo_rootx() + self.root.winfo_width() - window.winfo_width() - 24
@@ -313,9 +319,14 @@ class App:
                 elif kind == "result":
                     self.completed += 1
                     self.counter.set(f"本次确认完成 {self.completed} 项")
-                    self.notify(value.title)
                 elif kind == "task_failed":
                     self.add_log(f"任务未确认完成：{value.title}（{value.reason}）")
+                    self.notify("任务执行遇到故障", f"{value.title}：{value.reason}")
+                elif kind == "run_finished":
+                    if value is None:
+                        self.notify("本次执行完毕", f"确认完成 {self.completed} 项")
+                    else:
+                        self.notify("执行因故障停止", value)
                 elif kind == "error":
                     self.status.set(f"已停止：{value}")
                     self.add_log(value)
