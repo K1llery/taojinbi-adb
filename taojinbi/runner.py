@@ -262,7 +262,7 @@ class Runner:
         self.list_only(current)
         pending = current.task(title)
         energy_epoch = None
-        if pending and pending.kind == "open" and current.counter_full and current.coin_tasks_close() is not None:
+        if pending and pending.kind in ("open", "quiz") and current.counter_full and current.coin_tasks_close() is not None:
             energy_epoch = self.refresh_coin_list(title).epoch
             _, pending, _ = self.find(title)
             if pending is None or not pending.remaining:
@@ -481,6 +481,9 @@ class Runner:
         self.generic_anchor = None
         self.state(f"准备进入：{title}")
         before, before_total = self.tap_task(title)
+        if before.kind == "quiz":
+            from .quiz import run_quiz
+            return run_quiz(self, before, before_total)
         try:
             package = self.await_target(before)
             if package:

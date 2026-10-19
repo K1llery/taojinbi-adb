@@ -35,10 +35,11 @@ APP_PACKAGES = {
     "阿里云盘": "com.alicloud.databox",
     "闲鱼": "com.taobao.idlefish",
     "天猫": "com.tmall.wireless",
+    "点淘": "com.taobao.live",
+    "一淘": "com.taobao.etao",
+    "支付宝": "com.eg.android.AlipayGphone",
     "微博": "com.sina.weibo",
 }
-# Apps the user has ruled out even when they are installed.
-EXCLUDED_APPS = ("百度极速版",)
 # ``None`` means the device has not been read yet, so nothing is blocked.
 INSTALLED: set[str] | None = None
 
@@ -53,8 +54,6 @@ def missing_app(label: str) -> str:
     for name, package in APP_PACKAGES.items():
         if name not in label:
             continue
-        if name in EXCLUDED_APPS:
-            return name
         if INSTALLED is not None and package not in INSTALLED:
             return name
         # Longer app names are listed first; do not also require the regular edition.
@@ -139,6 +138,8 @@ class Task:
             return ""
         if missing_app(label):
             return ""
+        if self.title == "淘金币省钱等级考试" and re.fullmatch(r"去答题最高得\+\d+", self.detail):
+            return "quiz"
         explicit = self.seconds is not None or bool(JUMP_RE.search(self.detail))
         if OTHER_RE.search(self.detail) or (OTHER_RE.search(self.title) and not explicit):
             return ""
@@ -161,7 +162,7 @@ class Task:
             return "需要下载安装，跳过"
         missing = missing_app(label)
         if missing:
-            return f"未安装或已排除 {missing}，跳过"
+            return f"未安装 {missing}，跳过"
         if OTHER_RE.search(self.detail) or OTHER_RE.search(self.title):
             return "非纯浏览任务跳过"
         return "非计时浏览任务跳过"

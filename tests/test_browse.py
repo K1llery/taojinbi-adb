@@ -617,6 +617,24 @@ class InstalledAppTests(unittest.TestCase):
         self.assertFalse(task.supported)
         self.assertIn("快手", task.skip_reason)
 
+    def test_installed_baidu_lite_is_enabled_without_requiring_regular_baidu(self):
+        model.set_installed(["com.baidu.searchbox.lite"])
+        task = Task("去百度极速版领现金", 0, 1, None, "去百度极速版领现金+600", None)
+        self.assertEqual(task.kind, "open")
+        self.assertEqual(task.skip_reason, "")
+        self.assertEqual(model.missing_app("去百度App领现金"), "百度")
+
+    def test_additional_observed_apps_use_their_own_installed_packages(self):
+        for name, package in (("点淘", "com.taobao.live"), ("一淘", "com.taobao.etao"),
+                              ("支付宝", "com.eg.android.AlipayGphone")):
+            with self.subTest(name=name):
+                model.set_installed([package])
+                task = Task(f"去{name}签到领红包", 0, 1, None, "点击去逛+600", None)
+                self.assertEqual(task.kind, "open")
+                model.set_installed([])
+                self.assertFalse(task.supported)
+                self.assertIn(name, task.skip_reason)
+
     def test_unknown_device_state_never_blocks_a_task(self):
         model.set_installed(None)
         self.assertEqual(Task("去快手打卡领手机", 0, 1, None, "点击去逛+600", None).kind, "open")
