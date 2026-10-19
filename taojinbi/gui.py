@@ -220,7 +220,7 @@ class App:
             available = self.available(task)
             checked = "☑" if available and task.title in self.selected else "☐" if available else "—"
             if available:
-                state = "直播浏览" if task.kind == "live" else "跳转或站外" if task.kind == "open" else "站内浏览"
+                state = {"live": "直播浏览", "open": "跳转或站外", "quiz": "按长短规则答题"}.get(task.kind, "站内浏览")
             else:
                 state = "已完成" if not task.remaining else task.skip_reason
             self.table.insert("", "end", iid=task.title,
