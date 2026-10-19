@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,9 +11,9 @@ from typing import Callable
 
 from .adb import Adb, ROOT
 from .model import (PACKAGE, Halt, JumpDetected, Rect, RefreshRequired, Snapshot, Stopped,
-                    Task, TaskChanged, TaskFailed, set_installed, supported_title)
+                    Task, TaskChanged, TaskFailed, APP_PACKAGES, set_installed, supported_title)
 
-# A jump task grants its reward on entry, so it only needs the external app to appear.
+# Jump tasks without a timer only need a confirmed destination visit before verification.
 JUMP_DWELL = 2.0
 JUMP_LAUNCH_TIMEOUT = 20
 BACK_ATTEMPTS = 3
@@ -22,6 +23,9 @@ MAX_CONSECUTIVE_FAILURES = 3
 # An unknown in-app page is accepted after this many consecutive frames; its text keeps
 # moving (countdowns, prices), so identical frames can never be required.
 UNKNOWN_PAGE_FRAMES = 3
+LAUNCH_SYSTEM_PACKAGES = {"com.miui.securitycenter", "com.android.permissioncontroller",
+                          "com.google.android.permissioncontroller", "com.android.intentresolver", "android",
+                          "com.android.systemui", "com.miui.home", "com.android.launcher", "com.android.launcher3"}
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,10 @@ class Runner:
         self.failures: dict[str, int] = {}
         self.ambiguous: set[str] = set()
         self.generic_anchor: Rect | None = None
+        self.launch_confirmations = 0
+        self.baseline_energy: int | None = None
+        self.energy_epoch = 0
+        self.open_visit = False
 
     def log(self, message: str, **data):
         event = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -248,6 +256,17 @@ class Runner:
         return None
 
     def tap_task(self, title: str) -> tuple[Task, int | None]:
+        # The activity's balance stays stale behind the task modal. Refresh before
+        # capturing a capped jump's baseline so earlier rewards cannot be attributed.
+        current = self.observe()
+        self.list_only(current)
+        pending = current.task(title)
+        energy_epoch = None
+        if pending and pending.kind == "open" and current.counter_full and current.coin_tasks_close() is not None:
+            energy_epoch = self.refresh_coin_list(title).epoch
+            _, pending, _ = self.find(title)
+            if pending is None or not pending.remaining:
+                raise TaskChanged(f"刷新后任务已换名或完成：{title}")
         def build(s):
             task = s.task(title)
             if not task or not task.remaining:
@@ -262,6 +281,10 @@ class Runner:
         task = s.task(title)
         assert task is not None
         self.baseline_tasks = s.tasks()
+        self.launch_confirmations = 0
+        self.baseline_energy = s.coin_energy if energy_epoch is not None and energy_epoch == s.epoch else None
+        self.energy_epoch = s.epoch
+        self.open_visit = False
         return task, s.progress
 
     def enter(self, task: Task) -> Snapshot:
@@ -272,6 +295,9 @@ class Runner:
             # Read leniently: the app may switch between the tap and this frame, and that
             # switch is a jump to be finished, not a reason to stop the session.
             s = self.observe(external=True)
+            if self.handle_launch_dialog(s, task):
+                self.control.wait(.5)
+                continue
             if s.package != PACKAGE:
                 raise JumpDetected(s.package)
             kind = s.page_kind()
@@ -317,16 +343,22 @@ class Runner:
 
     def execute_timed(self, task: Task, before_total: int | None) -> Result:
         """Stay on the activity page for its stated duration, then verify by the global counter."""
-        seconds = task.seconds or 15
+        seconds = task.seconds if task.seconds is not None else JUMP_DWELL
         self.state(f"计时浏览：{task.title}（{seconds}秒，页面无奖励组件）")
-        deadline = self.control.clock() + seconds + 5
+        deadline = self.control.clock() + (seconds + 5 if task.seconds is not None else seconds)
         while self.control.clock() < deadline:
             self.control.wait(random.uniform(2, 4))
-            s = self.observe()
+            s = self.observe(external=True)
+            if self.handle_launch_dialog(s, task):
+                continue
+            if s.package != PACKAGE:
+                return self.finish_jump(task, before_total, s.package)
             if s.is_list:
                 raise TaskFailed("计时浏览期间已回到任务列表，本次跳过")
         self.adb.screenshot(self.directory / "before-return.png")
-        s = self.back("timed", "list", task.title)
+        if task.seconds is None:
+            self.open_visit = True
+        s = self.jump_back(task.title) if task.seconds is None else self.back("timed", "list", task.title)
         return self.verify_completion(task, before_total, s,
                                       "计时浏览后总进度增加1；页面无奖励组件，单项次数未归因")
 
@@ -355,7 +387,10 @@ class Runner:
         self.action(source, lambda s: ["keyevent", "4"], title)
         deadline = self.control.clock() + 15
         while self.control.clock() < deadline:
-            s = self.observe()
+            s = self.observe(external=True)
+            if "list" in destinations and (s.package != PACKAGE or s.coin_home or s.shop_home):
+                return self.jump_back(title)
+            s.check()
             if s.page_kind() in destinations:
                 return s
             self.control.wait(2)
@@ -447,7 +482,7 @@ class Runner:
         self.state(f"准备进入：{title}")
         before, before_total = self.tap_task(title)
         try:
-            package = self.await_target()
+            package = self.await_target(before)
             if package:
                 return self.finish_jump(before, before_total, package)
             self.enter(before)
@@ -488,22 +523,34 @@ class Runner:
             return self.record_success(before, s, "今日总进度已满，单项次数唯一增加1", row.done)
         if component and self.started_signal and self.finished_signal:
             return self.record_success(before, s, "今日总进度已满，奖励组件由浏览中转为完成；单项次数未归因")
+        if (before.kind == "open" and self.open_visit and self.baseline_energy is not None and
+                s.epoch == self.energy_epoch and
+                before.reward and int(before.reward) > 0 and
+                s.coin_energy == self.baseline_energy + int(before.reward)):
+            return self.record_success(before, s, "今日总进度已满，已确认目标跳转且赛车能量精确增加任务奖励；单项次数未归因")
         return None
 
     def verify_completion(self, before: Task, before_total: int | None, s: Snapshot,
                           reason: str) -> Result:
         deadline = self.control.clock() + 15
+        refreshed = False
         while True:
             if before_total is not None and s.progress == before_total + 1:
                 return self.record_success(before, s, reason)
             capped = self.capped_completion(s, before, before_total)
             if capped:
                 return capped
+            if (not refreshed and s.counter_full and self.open_visit and self.baseline_energy is not None and
+                    s.coin_tasks_close() is not None):
+                refreshed = True
+                s = self.refresh_coin_list(before.title)
+                continue
             if self.control.clock() >= deadline:
-                return self.record_failure(before, s)
+                reason = ("今日总进度已满，未确认单项次数或本次跳转的精确能量奖励" if s.counter_full else
+                          "返回后总进度没有增加1")
+                return self.record_failure(before, s, reason)
             self.control.wait(2)
-            s = self.observe()
-            self.list_only(s)
+            s = self.returned_list(before.title)
 
     def verify_browse(self, before: Task, before_total: int | None, s: Snapshot) -> Result:
         deadline = self.control.clock() + 15
@@ -524,8 +571,36 @@ class Runner:
             if self.control.clock() >= deadline:
                 return self.record_failure(before, s)
             self.control.wait(2)
-            s = self.observe()
-            self.list_only(s)
+            s = self.returned_list(before.title)
+
+    def returned_list(self, title: str) -> Snapshot:
+        s = self.observe(external=True)
+        if s.package != PACKAGE or s.coin_home or s.shop_home:
+            return self.jump_back(title)
+        s.check()
+        self.list_only(s)
+        return s
+
+    def refresh_coin_list(self, title: str) -> Snapshot:
+        def close(current):
+            button = current.coin_tasks_close()
+            if button is None:
+                raise Halt("刷新前任务列表关闭入口已变化")
+            return ["tap", *map(str, button.center)]
+        for _ in range(2):
+            self.action("list", close, title)
+            deadline = self.control.clock() + 3
+            while self.control.clock() < deadline:
+                self.control.wait(.25)
+                s = self.observe(external=True)
+                if s.package != PACKAGE:
+                    raise Halt("刷新任务弹层时前台已变化，停止刷新")
+                s.check()
+                if s.coin_home:
+                    return self.jump_back(title)
+                if not s.is_list:
+                    continue
+        raise Halt("未确认任务弹层已关闭，未使用旧能量数据")
 
     def back_inside_taobao(self, title: str) -> Snapshot:
         """Recheck the foreground and list on the exact snapshot used for the back press."""
@@ -534,7 +609,7 @@ class Runner:
             if s.package != PACKAGE:
                 return s
             s.check()
-            if s.is_list:
+            if s.is_list or s.coin_home or s.shop_home:
                 return s
             try:
                 self.adb.input(s, "keyevent", "4")
@@ -543,7 +618,46 @@ class Runner:
             except RefreshRequired:
                 self.control.checkpoint()
 
-    def await_target(self) -> str:
+    def handle_launch_dialog(self, s: Snapshot, task: Task | None) -> bool:
+        """Only accept the observed Xiaomi one-time launch of this task's target."""
+        system = s.package in LAUNCH_SYSTEM_PACKAGES or any(
+            n.get("package") in LAUNCH_SYSTEM_PACKAGES and
+            Rect.parse(n.get("bounds", "")).bottom > s.height * .1 and
+            Rect.parse(n.get("bounds", "")).top < s.height * .9 for n in s.nodes)
+        if not system:
+            return False
+        labels = {n.get("text", "").strip() for n in s.nodes
+                  if n.get("package") == "com.miui.securitycenter" and s.visible(n) and n.get("text", "").strip()}
+        prompts = [t for t in labels if ("想要打开" in t)]
+        if not prompts:
+            if not labels and s.package in (PACKAGE, "com.miui.securitycenter"):
+                return True  # Wait for the moving system panel to settle.
+            raise Halt("跳转遇到系统权限或应用选择窗口，请人工处理")
+        label = task.title + task.detail if task else ""
+        expected = set()
+        for name in APP_PACKAGES:
+            if name in label:
+                expected.add(name)  # Longer edition names precede the regular app.
+                break
+        if any(name in label for name in ("支付宝", "蚂蚁", "芭芭")):
+            expected.add("支付宝")
+        match = re.fullmatch(r"淘宝\s*想要打开\s*(.+?)，是否允许？", prompts[0]) if len(prompts) == 1 else None
+        buttons = [n for n in s.nodes if n.get("package") == "com.miui.securitycenter" and
+                   n.get("text") == "本次允许" and n.get("class") == "android.widget.Button" and
+                   n.get("clickable") == "true" and n.get("enabled", "true") == "true" and s.visible(n)]
+        if not ("启动应用" in labels and match and match[1] in expected and len(buttons) == 1):
+            raise Halt("无法确认本次任务的启动应用确认框，请人工处理")
+        if self.launch_confirmations >= 1:
+            raise TaskFailed("启动应用确认框重复出现，未重复授权")
+        try:
+            self.adb.input(s, "tap", *map(str, Rect.parse(buttons[0].get("bounds", "")).center))
+            self.launch_confirmations += 1
+            self.log("允许本次任务打开目标应用", task=task.title, target=match[1])
+        except RefreshRequired:
+            self.control.checkpoint()
+        return True
+
+    def await_target(self, task: Task | None = None) -> str:
         """Decide from the device, not the caption: an external package means a jump.
 
         The caption is only a hint. ``去惊喜好物逛一逛`` stays inside Taobao while
@@ -554,12 +668,34 @@ class Runner:
         deadline = self.control.clock() + JUMP_LAUNCH_TIMEOUT
         while self.control.clock() < deadline:
             s = self.observe(external=True)
+            if self.handle_launch_dialog(s, task):
+                self.control.wait(.5)
+                continue
             if s.package and s.package != PACKAGE:
                 return s.package
             if not s.is_list:
                 return ""
             self.control.wait(1)
         raise TaskFailed("点击去完成后没有确认目标页面，本次跳过")
+
+    def recover_coin_page(self, s: Snapshot) -> bool:
+        s.check()
+        try:
+            if s.coin_home:
+                button = s.coin_task_button()
+                if button is None:
+                    raise Halt("淘金币主页未找到唯一赚能量按钮")
+                self.adb.input(s, "tap", *map(str, button.center))
+                self.log("从淘金币主页重新打开任务列表")
+                return True
+            if s.shop_home:
+                self.adb.open_coin_home(s)
+                self.log("从淘宝首页重新打开淘金币活动")
+                return True
+        except RefreshRequired:
+            self.control.checkpoint()
+            return True
+        return False
 
     def resume_taobao(self):
         """Never relaunch while Taobao is already in front: Welcome would start a new
@@ -584,26 +720,36 @@ class Runner:
         while True:
             s = self.observe(external=True)
             if s.package == PACKAGE and s.is_list:
+                s.check()
                 return s
             if self.control.clock() >= deadline:
                 return None
             self.control.wait(1)
 
     def jump_back(self, title: str) -> Snapshot:
-        """Resume Taobao's own task, then walk back to the list only inside Taobao.
+        """Resume Taobao, reopen known home pages, or unwind its launching webview.
 
-        ``am start`` resumes the existing task stack, but that stack may still be showing
-        the in-Taobao page that launched the external app (闲鱼 opens through a Taobao
-        webview), so a bounded back press is still needed. Back is never pressed while
-        another app is in front and never from the list itself, so the session cannot
-        fall through to the Taobao home page.
+        Back is never pressed on the task list, either known home page, or another app.
         """
-        self.state("从外部应用返回淘宝")
+        self.state("恢复淘金币任务列表")
         deadline = self.control.clock() + 45
         presses = 0
+        recoveries = 0
         while self.control.clock() < deadline:
             self.resume_taobao()
-            s = self.settle_list(8)
+            current = self.observe(external=True)
+            if current.package == PACKAGE:
+                if current.is_list:
+                    current.check()
+                    return current
+                if current.coin_home or current.shop_home:
+                    if recoveries >= 3:
+                        raise Halt("重新打开淘金币任务列表超过上限，停止输入")
+                    self.recover_coin_page(current)
+                    recoveries += 1
+                    self.control.wait(1)
+                    continue
+            s = self.settle_list(2.4)
             if s is not None:
                 return s
             if self.adb.foreground() != PACKAGE:
@@ -616,6 +762,8 @@ class Runner:
             fresh = self.back_inside_taobao(title)
             if fresh.package == PACKAGE and fresh.is_list:
                 return fresh
+            if fresh.coin_home or fresh.shop_home:
+                continue
             if fresh.package == PACKAGE:
                 presses += 1
                 self.log("在淘宝内部返回一次", attempt=presses, task=title)
@@ -623,8 +771,9 @@ class Runner:
         raise Halt("从外部应用返回后没有回到任务列表")
 
     def finish_jump(self, before: Task, before_total: int | None, package: str) -> Result:
-        """A jump leaves no readable evidence outside Taobao; only the counter counts."""
+        """Return from the observed destination and verify Taobao's own reward evidence."""
         self.log("已跳转到外部应用", task=before.title, package=package)
+        self.open_visit = True
         self.adb.screenshot(self.directory / "jumped.png")
         self.control.wait(JUMP_DWELL)
         s = self.jump_back(before.title)
