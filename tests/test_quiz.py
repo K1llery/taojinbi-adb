@@ -166,6 +166,71 @@ class QuizTests(unittest.TestCase):
             run_quiz(self.runner, self.task, 50)
         self.assertEqual(self.adb.input.call_count, 2)
 
+    def test_three_option_question_is_parsed_and_uses_the_same_length_rule(self):
+        page = QuizPage(quiz(options=('六个字的选项', '更长一些的选项', '另一个短选项')))
+        self.assertEqual([o.letter for o in page.options], ['A', 'B', 'C'])
+        self.assertEqual(choose_option(page.options).letter, 'B')
+        self.assertEqual(self.choose(('非常长的一条选项', '短', '同样很长的一条选项')), 'B')
+
+    def test_two_options_choose_the_first_longest(self):
+        self.assertEqual(self.choose(('短', '长一点的选项')), 'B')
+        self.assertEqual(self.choose(('同长', '一样')), 'A')
+
+    def test_three_options_can_select_and_submit_without_a_d_marker(self):
+        strings = ('普通答案', '明显更长的一条答案', '其他答案')
+        self.adb.snapshot.side_effect = [quiz(options=strings), quiz(options=strings, selected=True)]
+        answer(self.runner, QuizPage(quiz(options=strings)))
+        self.assertEqual(self.adb.input.call_count, 2)
+        self.assertEqual(self.adb.input.call_args_list[0].args[1:], ('tap', '600', '1176'))
+
+    def test_hidden_fourth_option_cannot_turn_a_four_option_question_into_three(self):
+        for attributes in ({'visible-to-user': 'false'}, {'bounds': '[81,2700][123,2778]'}):
+            with self.subTest(attributes=attributes):
+                s = quiz()
+                next(n for n in s.nodes if n.get('text') == 'D').attrib.update(attributes)
+                with self.assertRaisesRegex(Halt, '未完整显示'):
+                    QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+
+    def test_missing_middle_option_is_not_accepted_as_a_three_option_question(self):
+        s = quiz()
+        n = next(n for n in s.nodes if n.get('text') == 'B')
+        s.parents[n].remove(n)
+        with self.assertRaisesRegex(Halt, '不完整'):
+            QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+
+    def test_option_count_change_after_selection_is_not_submitted(self):
+        self.adb.snapshot.side_effect = [quiz(), quiz(options=('短', '普通', '一般'), selected=True)]
+        with self.assertRaisesRegex(Halt, '题目或答题状态已变化'):
+            answer(self.runner, QuizPage(quiz()))
+        self.assertEqual(self.adb.input.call_count, 1)
+
+    def test_selection_and_feedback_images_do_not_change_option_text_or_identity(self):
+        initial = quiz(options=('普通答案', '比较长的一条答案', '其他答案'))
+        for label in ('selected', '正确', '错误'):
+            with self.subTest(label=label):
+                s = quiz(options=('普通答案', '比较长的一条答案', '其他答案'), selected=True)
+                row = s.parents[next(n for n in s.nodes if n.get('text') == 'B')]
+                node(row, label, '[1056,1134][1146,1221]', **{'class': 'android.widget.Image'})
+                parsed = QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+                self.assertEqual(parsed.signature, QuizPage(initial).signature)
+                self.assertEqual(choose_option(parsed.options).letter, 'B')
+
+    def test_extra_text_content_is_still_rejected(self):
+        s = quiz()
+        row = s.parents[next(n for n in s.nodes if n.get('text') == 'B')]
+        node(row, '另一段真正的选项文字')
+        with self.assertRaisesRegex(Halt, '内容有歧义'):
+            QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+
+    def test_five_option_question_is_not_silently_truncated(self):
+        s = quiz()
+        panel = next(n for n in s.nodes if n.get('class') == 'android.webkit.WebView')
+        row = node(panel, '', '[36,1800][1164,1977]', clickable='true')
+        node(row, 'E')
+        node(row, '第五个选项')
+        with self.assertRaisesRegex(Halt, '不完整'):
+            QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+
 
 if __name__ == '__main__':
     unittest.main()

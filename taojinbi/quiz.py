@@ -18,9 +18,11 @@ class Option:
 
 def choose_option(options: list[Option]) -> Option:
     """Pick the isolated short/long answer; ties default to the first longest."""
-    if len(options) != 4:
-        raise Halt("答题选项数量不符合已适配的四选一")
+    if not 2 <= len(options) <= 4 or len({o.letter for o in options}) != len(options):
+        raise Halt("答题选项数量不符合已适配的2至4个不同选项")
     lengths = {o.letter: len(re.sub(r"\s+", "", o.text)) for o in options}
+    if len(options) == 2:
+        return max(options, key=lambda o: lengths[o.letter])
     ordered = sorted(lengths.values())
     short = ordered[1] - ordered[0]
     long = ordered[-1] - ordered[-2]
@@ -35,22 +37,30 @@ class QuizPage:
                   n.get("text") == "淘金币趣味答题" and s.visible(n)]
         if len(panels) != 1:
             raise Halt("未识别到唯一淘金币答题页面")
-        self.nodes = [n for n in panels[0].iter("node") if s.visible(n)]
+        all_nodes = list(panels[0].iter("node"))
+        self.nodes = [n for n in all_nodes if s.visible(n)]
         labels = [n.get("text", "").strip() for n in self.nodes]
         questions = [t for t in labels if re.fullmatch(r"\d+\.\s*.+单选题", t, re.S)]
         if len(questions) != 1 or "淘金币答题" not in labels:
             raise Halt("答题题目有歧义或超出已适配的单选题范围")
         self.question = questions[0]
         self.options = []
-        for letter in "ABCD":
-            letters = [n for n in self.nodes if n.get("text") == letter]
+        markers = {letter: [n for n in all_nodes if n.get("text", "").strip() == letter] for letter in "ABCDE"}
+        available = [letter for letter, matches in markers.items() if matches]
+        if not 2 <= len(available) <= 4 or available != list("ABCD"[:len(available)]):
+            raise Halt("答题选项不完整，预期连续的A至B/C/D选项")
+        for letter in available:
+            letters = markers[letter]
             if len(letters) != 1:
-                raise Halt("答题选项标记有歧义")
+                raise Halt(f"答题选项{letter}重复出现，无法唯一定位")
+            if not s.visible(letters[0]):
+                raise Halt(f"答题选项{letter}未完整显示，停止输入")
             row = s.parents.get(letters[0])
             if row is None or row.get("clickable") != "true" or row.get("enabled", "true") != "true":
                 raise Halt("答题选项不可点击")
             values = [n.get("text", "").strip() for n in row.iter("node") if s.visible(n) and
-                      n.get("text", "").strip() and n.get("text") != letter]
+                      n.get("text", "").strip() and n.get("text", "").strip() != letter and
+                      n.get("class") not in ("android.widget.Image", "android.widget.ImageView")]
             if len(values) != 1 or not s.visible(row):
                 raise Halt("答题选项内容有歧义")
             self.options.append(Option(letter, values[0], Rect.parse(row.get("bounds", ""))))
