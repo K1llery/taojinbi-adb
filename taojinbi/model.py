@@ -229,7 +229,7 @@ class Snapshot:
             return None
         targets = []
         for n in self.nodes:
-            if (n.get("resource-id") == "energy_task_button" and n.get("text") == "赚能量" and
+            if (n.get("resource-id") == "energy_task_button" and n.get("text") in ("赚能量", "去赚能量") and
                     n.get("clickable") == "true" and n.get("enabled", "true") == "true" and
                     n.get("visible-to-user", "true") == "true"):
                 r = Rect.parse(n.get("bounds", ""))

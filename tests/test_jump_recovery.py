@@ -68,6 +68,20 @@ class JumpRecoveryTests(unittest.TestCase):
         self.assertEqual(coin_home().coin_task_button(), Rect(951, 1002, 1200, 1164))
         self.assertIsNone(coin_home(list_page=True).coin_task_button())
 
+    def test_coin_home_button_accepts_the_observed_go_earn_label(self):
+        s = coin_home()
+        next(n for n in s.nodes if n.get('resource-id') == 'energy_task_button').set('text', '去赚能量')
+        s = Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670)
+        self.assertEqual(s.coin_task_button(), Rect(951, 1002, 1200, 1164))
+
+    def test_home_recovery_with_the_go_earn_label_reopens_the_list(self):
+        s = coin_home()
+        next(n for n in s.nodes if n.get('resource-id') == 'energy_task_button').set('text', '去赚能量')
+        s = Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670)
+        self.adb.snapshot.side_effect = [s, page()]
+        self.assertTrue(self.runner.jump_back('test').is_list)
+        self.assertEqual(self.adb.input.call_args.args[1:], ('tap', '1075', '1083'))
+
     def test_return_reopens_coin_home_modal_without_pressing_back(self):
         self.adb.snapshot.side_effect = [coin_home(), page()]
         self.assertTrue(self.runner.jump_back('test').is_list)
