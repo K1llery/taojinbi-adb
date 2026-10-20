@@ -68,6 +68,20 @@ class JumpRecoveryTests(unittest.TestCase):
         self.assertEqual(coin_home().coin_task_button(), Rect(951, 1002, 1200, 1164))
         self.assertIsNone(coin_home(list_page=True).coin_task_button())
 
+    def test_coin_home_button_accepts_the_observed_go_earn_label(self):
+        s = coin_home()
+        next(n for n in s.nodes if n.get('resource-id') == 'energy_task_button').set('text', '去赚能量')
+        s = Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670)
+        self.assertEqual(s.coin_task_button(), Rect(951, 1002, 1200, 1164))
+
+    def test_home_recovery_with_the_go_earn_label_reopens_the_list(self):
+        s = coin_home()
+        next(n for n in s.nodes if n.get('resource-id') == 'energy_task_button').set('text', '去赚能量')
+        s = Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670)
+        self.adb.snapshot.side_effect = [s, page()]
+        self.assertTrue(self.runner.jump_back('test').is_list)
+        self.assertEqual(self.adb.input.call_args.args[1:], ('tap', '1075', '1083'))
+
     def test_return_reopens_coin_home_modal_without_pressing_back(self):
         self.adb.snapshot.side_effect = [coin_home(), page()]
         self.assertTrue(self.runner.jump_back('test').is_list)
@@ -132,12 +146,12 @@ class JumpRecoveryTests(unittest.TestCase):
         self.assertEqual(self.runner.await_target(self.task), 'com.sina.weibo')
         self.adb.launch_taobao.assert_not_called()
 
-    def test_capped_completion_requires_exact_energy_and_observed_visit(self):
+    def test_stale_background_energy_never_confirms_capped_completion(self):
         self.runner.baseline_energy = 100000
         self.runner.open_visit = True
         s = coin_home(list_page=True, energy=100400)
         result = self.runner.capped_completion(s, self.task, 50)
-        self.assertTrue(result.success)
+        self.assertIsNone(result)
         for energy, visited in ((100000, True), (100399, True), (100401, True), (100400, False)):
             self.runner.open_visit = visited
             self.assertIsNone(self.runner.capped_completion(
@@ -150,7 +164,7 @@ class JumpRecoveryTests(unittest.TestCase):
         s = Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670)
         self.assertIsNone(s.coin_energy)
 
-    def test_capped_energy_is_refreshed_once_before_confirming(self):
+    def test_capped_visit_does_not_close_the_list_to_refresh_energy(self):
         s = coin_home(list_page=True, energy=100000)
         node(s.root, '关闭', '[1071,513][1170,612]', clickable='true',
              **{'class': 'android.widget.Button'})
@@ -158,12 +172,25 @@ class JumpRecoveryTests(unittest.TestCase):
         self.runner.baseline_energy = 100000
         self.runner.open_visit = True
         self.runner.action = Mock()
-        self.adb.snapshot.return_value = coin_home(energy=100400)
-        self.runner.jump_back = Mock(return_value=coin_home(list_page=True, energy=100400))
+        self.adb.snapshot.return_value = s
+        self.runner.refresh_coin_list = Mock(side_effect=AssertionError('不能主动刷新'))
         result = self.runner.verify_completion(self.task, 50, s, 'test')
-        self.assertTrue(result.success)
-        self.runner.action.assert_called_once()
-        self.runner.jump_back.assert_called_once()
+        self.assertFalse(result.success)
+        self.assertEqual(self.runner.visits, [result])
+        self.runner.action.assert_not_called()
+        self.runner.refresh_coin_list.assert_not_called()
+        self.adb.input.assert_not_called()
+
+    def test_actual_external_visit_is_not_retried_even_when_caption_is_browse(self):
+        task = Task('浏览后跳到外部', 0, 1, 5, '浏览5秒+400', None)
+        s = coin_home(list_page=True, energy=100000)
+        self.adb.snapshot.return_value = s
+        self.runner.open_visit = True
+        result = self.runner.verify_completion(task, 50, s, 'test')
+        self.assertFalse(result.success)
+        self.assertEqual(self.runner.visits, [result])
+        self.assertIn(task.title, self.runner.skip)
+        self.adb.input.assert_not_called()
 
     def test_zero_reward_cannot_confirm_an_unchanged_energy_balance(self):
         self.runner.baseline_energy = 100000
@@ -171,26 +198,24 @@ class JumpRecoveryTests(unittest.TestCase):
         task = Task('跳转任务', 0, 1, None, '点击去逛+0', None)
         self.assertIsNone(self.runner.capped_completion(coin_home(list_page=True), task, 50))
 
-    def test_baseline_is_refreshed_before_tapping_so_an_earlier_reward_cannot_be_borrowed(self):
-        stale, fresh = jump_list(100000), jump_list(100400)
-        self.adb.snapshot.side_effect = [stale, fresh]
-        self.runner.refresh_coin_list = Mock(return_value=fresh)
-        self.runner.find = Mock(return_value=(fresh, fresh.task(self.task.title), False))
-        task, _ = self.runner.tap_task(self.task.title)
-        self.assertEqual(self.runner.baseline_energy, 100400)
-        self.runner.refresh_coin_list.assert_called_once()
-        self.runner.open_visit = True
-        self.assertIsNone(self.runner.capped_completion(fresh, task, 50))
+    def test_task_start_only_taps_the_task_without_closing_the_list(self):
+        self.adb.snapshot.return_value = jump_list(100000)
+        self.runner.refresh_coin_list = Mock(side_effect=AssertionError('不能主动刷新'))
+        self.runner.tap_task(self.task.title)
+        self.runner.refresh_coin_list.assert_not_called()
+        self.adb.input.assert_called_once()
+        self.assertEqual(self.adb.input.call_args.args[1:], ('tap','1045','950'))
 
-    def test_energy_baseline_is_disabled_if_pause_occurs_after_refresh(self):
+    def test_task_start_reobserves_after_pause_without_a_home_detour(self):
         s = jump_list(100000)
         fresh = jump_list(100400)
         fresh.epoch = 1
         self.adb.snapshot.side_effect = [s, fresh]
-        self.runner.refresh_coin_list = Mock(return_value=s)
-        self.runner.find = Mock(return_value=(fresh, fresh.task(self.task.title), False))
+        self.adb.input.side_effect = [RefreshRequired(), None]
+        self.runner.refresh_coin_list = Mock(side_effect=AssertionError('不能主动刷新'))
         self.runner.tap_task(self.task.title)
-        self.assertIsNone(self.runner.baseline_energy)
+        self.assertIs(self.adb.input.call_args.args[0], fresh)
+        self.runner.refresh_coin_list.assert_not_called()
 
     def test_pause_invalidates_energy_completion_evidence(self):
         self.runner.baseline_energy = 100000
@@ -213,24 +238,6 @@ class JumpRecoveryTests(unittest.TestCase):
             self.runner.handle_launch_dialog(launch_dialog(target='快手'), task)
         self.adb.input.assert_not_called()
         self.assertTrue(self.runner.handle_launch_dialog(launch_dialog(target='快手极速版'), task))
-
-    def test_ignored_close_cannot_be_treated_as_an_energy_refresh(self):
-        self.runner.action = Mock()
-        self.runner.jump_back = Mock()
-        self.adb.snapshot.return_value = jump_list(100000)
-        with self.assertRaisesRegex(Halt, '未确认任务弹层已关闭'):
-            self.runner.refresh_coin_list('test')
-        self.assertEqual(self.runner.action.call_count, 2)
-        self.runner.jump_back.assert_not_called()
-
-    def test_refresh_waits_until_the_old_list_has_disappeared(self):
-        self.runner.action = Mock()
-        self.runner.jump_back = Mock(return_value=jump_list(100400))
-        self.adb.snapshot.side_effect = [jump_list(100000), coin_home(energy=100400)]
-        s = self.runner.refresh_coin_list('test')
-        self.assertEqual(s.coin_energy, 100400)
-        self.assertEqual(self.adb.snapshot.call_count, 2)
-        self.runner.action.assert_called_once()
 
     def test_only_verified_shop_home_can_open_the_fixed_coin_url(self):
         adb = Adb('adb.exe')

@@ -8,7 +8,7 @@ from unittest.mock import Mock
 from taojinbi import model
 from taojinbi.adb import Control
 from taojinbi.gui import App
-from taojinbi.model import Halt, PACKAGE, RefreshRequired, Snapshot, Task
+from taojinbi.model import Halt, PACKAGE, Rect, RefreshRequired, Snapshot, Task
 from taojinbi.runner import Result, Runner
 from tests.test_core import node, page
 
@@ -117,7 +117,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.adb.foreground.call_count, 2)
 
     def test_rotating_failed_names_have_a_session_wide_limit(self):
-        tasks = [Task(name, 2, 5, 15, '浏览15秒+400', None) for name in ['A', 'B', 'C']]
+        tasks = [Task(name, 2, 5, 15, '浏览15秒+400', Rect(900,900,1100,1000)) for name in ['A', 'B', 'C']]
         self.adb.lease.side_effect = lambda: nullcontext()
         self.adb.foreground.return_value = PACKAGE
         self.runner.scan = Mock()

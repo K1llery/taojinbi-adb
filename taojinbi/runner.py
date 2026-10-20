@@ -84,6 +84,7 @@ class Runner:
         self.last: Snapshot | None = None
         self.steps = 0
         self.results: list[Result] = []
+        self.visits: list[Result] = []
         self.baseline_tasks: list[Task] = []
         self.page = ""
         self.started_signal = False
@@ -98,8 +99,6 @@ class Runner:
         self.ambiguous: set[str] = set()
         self.generic_anchor: Rect | None = None
         self.launch_confirmations = 0
-        self.baseline_energy: int | None = None
-        self.energy_epoch = 0
         self.open_visit = False
 
     def log(self, message: str, **data):
@@ -221,7 +220,7 @@ class Runner:
 
     @staticmethod
     def candidate(tasks: list[Task]) -> Task | None:
-        pending = [t for t in tasks if t.supported and t.remaining]
+        pending = [t for t in tasks if t.supported and t.remaining and t.button is not None]
         return min(pending, key=lambda t: (t.seconds or 120, t.done, t.title)) if pending else None
 
     def discover(self) -> Task | None:
@@ -232,8 +231,9 @@ class Runner:
         if candidate:
             return candidate
         # Verify exhaustion across the whole scrollable list, not only the viewport.
+        self.state("当前区域无可执行任务，检查一次列表上下边界，确认无任务后结束")
         for down in (False, True):
-            previous = None
+            previous = s.fingerprint()
             for _ in range(12):
                 self.list_scroll(down)
                 s = self.observe()
@@ -256,17 +256,6 @@ class Runner:
         return None
 
     def tap_task(self, title: str) -> tuple[Task, int | None]:
-        # The activity's balance stays stale behind the task modal. Refresh before
-        # capturing a capped jump's baseline so earlier rewards cannot be attributed.
-        current = self.observe()
-        self.list_only(current)
-        pending = current.task(title)
-        energy_epoch = None
-        if pending and pending.kind in ("open", "quiz") and current.counter_full and current.coin_tasks_close() is not None:
-            energy_epoch = self.refresh_coin_list(title).epoch
-            _, pending, _ = self.find(title)
-            if pending is None or not pending.remaining:
-                raise TaskChanged(f"刷新后任务已换名或完成：{title}")
         def build(s):
             task = s.task(title)
             if not task or not task.remaining:
@@ -282,8 +271,6 @@ class Runner:
         assert task is not None
         self.baseline_tasks = s.tasks()
         self.launch_confirmations = 0
-        self.baseline_energy = s.coin_energy if energy_epoch is not None and energy_epoch == s.epoch else None
-        self.energy_epoch = s.epoch
         self.open_visit = False
         return task, s.progress
 
@@ -516,6 +503,13 @@ class Runner:
         self.emit("task_failed", result)
         return result
 
+    def record_visit(self, before: Task, reason: str) -> Result:
+        result = Result(before.title, before.done, None, False, reason)
+        self.visits.append(result)
+        self.skip.add(before.title)
+        self.log("已访问，奖励未确认，本轮不再重复", **asdict(result))
+        return result
+
     def capped_completion(self, s: Snapshot, before: Task, before_total: int | None,
                           component: bool = False) -> Result | None:
         """A missing caption is never evidence: it can be renamed, hidden or ambiguous."""
@@ -526,31 +520,22 @@ class Runner:
             return self.record_success(before, s, "今日总进度已满，单项次数唯一增加1", row.done)
         if component and self.started_signal and self.finished_signal:
             return self.record_success(before, s, "今日总进度已满，奖励组件由浏览中转为完成；单项次数未归因")
-        if (before.kind == "open" and self.open_visit and self.baseline_energy is not None and
-                s.epoch == self.energy_epoch and
-                before.reward and int(before.reward) > 0 and
-                s.coin_energy == self.baseline_energy + int(before.reward)):
-            return self.record_success(before, s, "今日总进度已满，已确认目标跳转且赛车能量精确增加任务奖励；单项次数未归因")
         return None
 
     def verify_completion(self, before: Task, before_total: int | None, s: Snapshot,
                           reason: str) -> Result:
-        deadline = self.control.clock() + 15
-        refreshed = False
+        deadline = self.control.clock() + (2.4 if s.counter_full else 15)
         while True:
             if before_total is not None and s.progress == before_total + 1:
                 return self.record_success(before, s, reason)
             capped = self.capped_completion(s, before, before_total)
             if capped:
                 return capped
-            if (not refreshed and s.counter_full and self.open_visit and self.baseline_energy is not None and
-                    s.coin_tasks_close() is not None):
-                refreshed = True
-                s = self.refresh_coin_list(before.title)
-                continue
             if self.control.clock() >= deadline:
-                reason = ("今日总进度已满，未确认单项次数或本次跳转的精确能量奖励" if s.counter_full else
+                reason = ("今日总进度已满，当前列表未确认单项次数" if s.counter_full else
                           "返回后总进度没有增加1")
+                if self.open_visit:
+                    return self.record_visit(before, reason)
                 return self.record_failure(before, s, reason)
             self.control.wait(2)
             s = self.returned_list(before.title)
@@ -583,27 +568,6 @@ class Runner:
         s.check()
         self.list_only(s)
         return s
-
-    def refresh_coin_list(self, title: str) -> Snapshot:
-        def close(current):
-            button = current.coin_tasks_close()
-            if button is None:
-                raise Halt("刷新前任务列表关闭入口已变化")
-            return ["tap", *map(str, button.center)]
-        for _ in range(2):
-            self.action("list", close, title)
-            deadline = self.control.clock() + 3
-            while self.control.clock() < deadline:
-                self.control.wait(.25)
-                s = self.observe(external=True)
-                if s.package != PACKAGE:
-                    raise Halt("刷新任务弹层时前台已变化，停止刷新")
-                s.check()
-                if s.coin_home:
-                    return self.jump_back(title)
-                if not s.is_list:
-                    continue
-        raise Halt("未确认任务弹层已关闭，未使用旧能量数据")
 
     def back_inside_taobao(self, title: str) -> Snapshot:
         """Recheck the foreground and list on the exact snapshot used for the back press."""
@@ -825,7 +789,8 @@ class Runner:
                 if all_browse:
                     candidate = self.discover()
                     if candidate is None:
-                        self.state("全部可执行任务已耗尽，会话结束")
+                        self.state("全部可执行任务已耗尽，会话结束" +
+                                   (f"；{len(self.visits)}项已访问，奖励未确认" if self.visits else ""))
                         return
                     current_titles = [candidate.title]
                 else:
@@ -837,6 +802,20 @@ class Runner:
                     s, task, full = self.find(title)
                     if not task or not task.remaining:
                         self.log("当前选定任务已耗尽或不在完整列表中", task=title)
+                        if all_browse:
+                            self.skip.add(title)
+                            changes += 1
+                            if changes >= 5:
+                                self.state("连续5次无法定位可执行任务，结束本轮，等待重新扫描")
+                                return
+                        continue
+                    if task.button is None:
+                        self.skip.add(title)
+                        if all_browse:
+                            changes += 1
+                            if changes >= 5:
+                                self.state("连续5次任务按钮不可用，结束本轮，等待重新扫描")
+                                return
                         continue
                     if not task.supported:
                         # Uninstalled or excluded apps are a skip, not a reason to stop.
@@ -864,7 +843,9 @@ class Runner:
                         result = None
                         self.recover_list(title)
                     changes = 0
-                    if result is None or not result.success:
+                    if result is not None and result in self.visits:
+                        consecutive_failures = 0
+                    elif result is None or not result.success:
                         consecutive_failures += 1
                         self.failures[title] = self.failures.get(title, 0) + 1
                         if self.failures[title] >= MAX_TASK_FAILURES:
@@ -874,8 +855,8 @@ class Runner:
                             raise Halt("连续3次任务未确认完成，已停止，避免任务换名后反复执行")
                         continue
                     consecutive_failures = 0
-                    if limit is not None and len(self.results) >= limit:
-                        self.state(f"达到本次上限：{len(self.results)} 项已完成")
+                    if limit is not None and len(self.results) + len(self.visits) >= limit:
+                        self.state(f"达到本次上限：{len(self.results)} 项已确认，{len(self.visits)} 项已访问待核验")
                         return
                     self.state("任务间阅读间隔")
                     self.control.wait(random.uniform(5, 10))
@@ -893,6 +874,8 @@ class Runner:
         finally:
             (self.directory / "results.json").write_text(
                 json.dumps([asdict(r) for r in self.results], ensure_ascii=False, indent=2), encoding="utf-8")
+            (self.directory / "visits.json").write_text(
+                json.dumps([asdict(r) for r in self.visits], ensure_ascii=False, indent=2), encoding="utf-8")
 
     def fail(self, exc: Exception):
         self.state(f"已停止：{exc}")
