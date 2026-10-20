@@ -119,35 +119,42 @@ class QuizTests(unittest.TestCase):
         result = run_quiz(self.runner, self.task, 50)
         self.assertTrue(result.success)
         self.assertIn('答案错误', result.reason)
-        self.assertIn('实际增加200能量', result.reason)
+        self.assertIn('未额外刷新读取金额', result.reason)
+        self.runner.refresh_coin_list.assert_not_called()
         self.assertEqual(self.adb.input.call_count, 3)
 
-    def test_result_button_without_reward_increase_does_not_confirm_completion(self):
+    def test_old_claim_is_not_counted_as_a_new_completion_or_refreshed(self):
         self.adb.snapshot.return_value = quiz(feedback=True, finished=True)
         self.runner.baseline_energy = 100000
         after = coin_home(list_page=True, energy=100000)
         self.runner.jump_back = Mock(return_value=after)
         self.runner.refresh_coin_list = Mock(return_value=after)
         self.assertFalse(run_quiz(self.runner, self.task, 50).success)
+        self.assertEqual(len(self.runner.visits), 1)
+        self.assertIn(self.task.title, self.runner.skip)
+        self.runner.refresh_coin_list.assert_not_called()
 
-    def test_pause_invalidates_partial_reward_evidence(self):
+    def test_old_claim_does_not_report_an_unread_energy_amount(self):
         self.adb.snapshot.return_value = quiz(feedback=True, finished=True)
         self.runner.baseline_energy = 100000
         after = coin_home(list_page=True, energy=100200)
         after.epoch = 1
         self.runner.jump_back = Mock(return_value=after)
         self.runner.refresh_coin_list = Mock(return_value=after)
-        self.assertFalse(run_quiz(self.runner, self.task, 50).success)
+        result = run_quiz(self.runner, self.task, 50)
+        self.assertFalse(result.success)
+        self.assertNotIn('200', result.reason)
+        self.runner.refresh_coin_list.assert_not_called()
 
     def test_loading_page_is_waited_for_without_clicking(self):
         loading = Snapshot('<hierarchy/>', PACKAGE, 1200, 2670)
-        self.adb.snapshot.side_effect = [loading, quiz(feedback=True, finished=True)]
+        self.adb.snapshot.side_effect = [loading, quiz(), quiz(), quiz(selected=True), quiz(feedback=True, finished=True)]
         self.runner.baseline_energy = 100000
         after = coin_home(list_page=True, energy=100200)
         self.runner.jump_back = Mock(return_value=after)
         self.runner.refresh_coin_list = Mock(return_value=after)
         self.assertTrue(run_quiz(self.runner, self.task, 50).success)
-        self.assertEqual(self.adb.input.call_count, 1)
+        self.assertEqual(self.adb.input.call_count, 3)
 
     def test_feedback_delay_does_not_submit_the_same_question_again(self):
         self.adb.snapshot.side_effect = [quiz(), quiz(), quiz(selected=True),
@@ -230,6 +237,14 @@ class QuizTests(unittest.TestCase):
         node(row, '第五个选项')
         with self.assertRaisesRegex(Halt, '不完整'):
             QuizPage(Snapshot(ET.tostring(s.root, encoding='unicode'), PACKAGE, 1200, 2670))
+
+    def test_completed_single_quiz_is_skipped_even_if_task_counter_stays_stale(self):
+        self.adb.snapshot.side_effect = [quiz(), quiz(), quiz(selected=True), quiz(feedback=True, finished=True)]
+        after = coin_home(list_page=True)
+        self.runner.jump_back = Mock(return_value=after)
+        self.assertTrue(run_quiz(self.runner, self.task, 50).success)
+        self.assertIn(self.task.title, self.runner.skip)
+        self.assertEqual(len(self.runner.results), 1)
 
 
 if __name__ == '__main__':

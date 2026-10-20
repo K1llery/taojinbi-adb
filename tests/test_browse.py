@@ -315,10 +315,10 @@ class DiscoveryTests(unittest.TestCase):
         pending = page([("新增浏览", 0, 5, 900)])
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(Mock(control=Control()), directory=Path(folder))
-            runner.observe = Mock(side_effect=[a, a, a, b, c, pending])
+            runner.observe = Mock(side_effect=[a, a, b, c, pending])
             runner.list_scroll = Mock()
             self.assertEqual(runner.discover().title, "新增浏览")
-            self.assertEqual(runner.observe.call_count, 6)
+            self.assertEqual(runner.observe.call_count, 5)
 
     def test_unrecognizable_region_cannot_be_reported_as_exhausted(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -333,8 +333,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(Runner.candidate(s.tasks()).title, "看看#新商品")
 
     def test_auto_mode_discovers_new_caption_each_round(self):
-        first = Task("看看#商品A", 0, 5, 15, "浏览15秒+400", None)
-        second = Task("商品B的新任务名", 1, 5, 15, "浏览15秒+400", None)
+        first = Task("看看#商品A", 0, 5, 15, "浏览15秒+400", Rect(900,900,1100,1000))
+        second = Task("商品B的新任务名", 1, 5, 15, "浏览15秒+400", Rect(900,900,1100,1000))
         adb = Mock(control=Control())
         adb.lease.side_effect = lambda: nullcontext()
         adb.control.wait = Mock()
@@ -356,7 +356,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(len(json.loads((Path(folder)/'results.json').read_text(encoding='utf-8'))), 2)
 
     def test_changed_caption_before_tap_is_rediscovered_without_retry_click(self):
-        task = Task("好物随心逛", 0, 5, 15, "浏览15秒+400", None)
+        task = Task("好物随心逛", 0, 5, 15, "浏览15秒+400", Rect(900,900,1100,1000))
         adb = Mock(control=Control())
         adb.lease.side_effect = lambda: nullcontext()
         adb.foreground.return_value = PACKAGE
@@ -482,7 +482,7 @@ class JumpTaskTests(unittest.TestCase):
         adb.lease.side_effect = lambda: nullcontext()
         adb.control.wait = Mock()
         adb.foreground.return_value = PACKAGE
-        other = Task("看看#新商品", 0, 10, 15, "浏览15秒+400", None)
+        other = Task("看看#新商品", 0, 10, 15, "浏览15秒+400", Rect(900,900,1100,1000))
         with tempfile.TemporaryDirectory() as folder:
             runner = Runner(adb, directory=Path(folder))
             runner.scan = Mock()

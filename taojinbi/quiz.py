@@ -136,19 +136,13 @@ def run_quiz(runner, task: Task, before_total: int | None):
                 runner.control.checkpoint()
                 continue
             s = runner.jump_back(task.title)
-            if s.counter_full and runner.baseline_energy is not None:
-                s = runner.refresh_coin_list(task.title)
             row = s.task(task.title)
-            delta = s.coin_energy - runner.baseline_energy if (
-                s.coin_energy is not None and runner.baseline_energy is not None and s.epoch == runner.energy_epoch) else None
-            if ((before_total is not None and s.progress == before_total + 1) or
-                    (row is not None and row.total == task.total and row.done == task.done + 1) or
-                    (delta is not None and task.reward and 0 < delta <= int(task.reward))):
-                return runner.record_success(task, s,
-                    f"答题页确认奖励已领取，返回后奖励已核验；答案{'正确' if correct == chosen else '错误'}" +
-                    (f"，实际增加{delta}能量" if delta is not None else ""),
-                    row.done if row is not None and row.done == task.done + 1 else None)
-            return runner.record_failure(task, s, "答题页已结束，但返回后奖励未确认，不会重复答题")
+            if not submitted:
+                return runner.record_visit(task, "进入时已是领取结果页，本轮未新提交，不重复记完成")
+            runner.skip.add(task.title)
+            return runner.record_success(task, s,
+                f"本次答题结果页已确认领取奖励；答案{'正确' if correct == chosen else '错误'}，未额外刷新读取金额",
+                row.done if row is not None and row.total == task.total and row.done == task.done + 1 else None)
         if page.feedback is None and not submitted:
             answer(runner, page)
             submitted = True

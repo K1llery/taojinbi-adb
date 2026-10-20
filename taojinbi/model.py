@@ -32,6 +32,7 @@ APP_PACKAGES = {
     "1688": "com.alibaba.wireless",
     "钉钉": "com.alibaba.android.rimet",
     "淘特": "com.taobao.mobile.wxt",
+    "淘宝特价版": "com.taobao.mobile.wxt",
     "阿里云盘": "com.alicloud.databox",
     "闲鱼": "com.taobao.idlefish",
     "天猫": "com.tmall.wireless",
@@ -251,14 +252,6 @@ class Snapshot:
             if match:
                 values.append(int(match[1]))
         return values[0] if len(values) == 1 else None
-
-    def coin_tasks_close(self) -> Rect | None:
-        if not self.is_list:
-            return None
-        buttons = [n for n in self.nodes if n.get("text") == "关闭" and
-                   n.get("class") == "android.widget.Button" and n.get("clickable") == "true" and
-                   n.get("enabled", "true") == "true" and self.visible(n)]
-        return Rect.parse(buttons[0].get("bounds", "")) if len(buttons) == 1 else None
 
     @property
     def progress_pair(self) -> tuple[int, int] | None:
